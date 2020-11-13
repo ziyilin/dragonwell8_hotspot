@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -34,6 +34,7 @@
 #include "services/management.hpp"
 #include "utilities/macros.hpp"
 #include "oops/objArrayOop.hpp"
+#include "gc_implementation/g1/elasticHeap.hpp"
 
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
 
@@ -63,6 +64,7 @@ void DCmdRegistrant::register_dcmds(){
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<ThreadDumpDCmd>(full_export, true, false));
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<RotateGCLogDCmd>(full_export, true, false));
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<ClassLoaderStatsDCmd>(full_export, true, false));
+  DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<JWarmupDCmd>(full_export, true, false));
 
   // Enhanced JMX Agent Support
   // These commands won't be exported via the DiagnosticCommandMBean until an
@@ -72,6 +74,7 @@ void DCmdRegistrant::register_dcmds(){
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<JMXStartLocalDCmd>(jmx_agent_export_flags, true,false));
   DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<JMXStopRemoteDCmd>(jmx_agent_export_flags, true,false));
 
+  DCmdFactory::register_DCmdFactory(new DCmdFactoryImpl<ElasticHeapDCmd>(full_export, true, false));
 }
 
 #ifndef HAVE_EXTRA_DCMD
@@ -339,8 +342,11 @@ HeapDumpDCmd::HeapDumpDCmd(outputStream* output, bool heap) :
                            DCmdWithParser(output, heap),
   _filename("filename","Name of the dump file", "STRING",true),
   _all("-all", "Dump all objects, including unreachable objects",
+       "BOOLEAN", false, "false"),
+  _mini_dump("-mini", "Use mini-dump format",
        "BOOLEAN", false, "false") {
   _dcmdparser.add_dcmd_option(&_all);
+  _dcmdparser.add_dcmd_option(&_mini_dump);
   _dcmdparser.add_dcmd_argument(&_filename);
 }
 
@@ -348,10 +354,14 @@ void HeapDumpDCmd::execute(DCmdSource source, TRAPS) {
   // Request a full GC before heap dump if _all is false
   // This helps reduces the amount of unreachable objects in the dump
   // and makes it easier to browse.
-  HeapDumper dumper(!_all.value() /* request GC if _all is false*/);
+  HeapDumper dumper(!_all.value() /* request GC if _all is false*/, _mini_dump.value());
   int res = dumper.dump(_filename.value());
   if (res == 0) {
-    output()->print_cr("Heap dump file created");
+    if (_mini_dump.value()) {
+      output()->print_cr("Mini heap dump file created");
+    } else {
+      output()->print_cr("Heap dump file created");
+    }
   } else {
     // heap dump failed
     ResourceMark rm;
@@ -734,5 +744,221 @@ void RotateGCLogDCmd::execute(DCmdSource source, TRAPS) {
     VMThread::execute(&rotateop);
   } else {
     output()->print_cr("Target VM does not support GC log file rotation.");
+  }
+}
+
+JWarmupDCmd::JWarmupDCmd(outputStream* output, bool heap_allocated) : DCmdWithParser(output, heap_allocated),
+  _notify_startup("-notify", "Notify JVM that application startup is done", "BOOLEAN", false, "false"),
+  _check_compile_finished("-check", "Check if the last compilation submitted by JWarmup is complete", "BOOLEAN", false, "false"),
+  _deopt("-deopt", "Notify JVM to de-optimize warmup methods", "BOOLEAN", false, "false"),
+  _help("-help", "Print this help information", "BOOLEAN", false, "false")
+{
+  _dcmdparser.add_dcmd_option(&_notify_startup);
+  _dcmdparser.add_dcmd_option(&_check_compile_finished);
+  _dcmdparser.add_dcmd_option(&_deopt);
+  _dcmdparser.add_dcmd_option(&_help);
+}
+
+int JWarmupDCmd::num_arguments() {
+  ResourceMark rm;
+  JWarmupDCmd* dcmd = new JWarmupDCmd(NULL, false);
+  if (dcmd != NULL) {
+    DCmdMark mark(dcmd);
+    return dcmd->_dcmdparser.num_arguments();
+  } else {
+    return 0;
+  }
+}
+
+void JWarmupDCmd::execute(DCmdSource source, TRAPS) {
+  assert(is_init_completed(), "JVM is not fully initialized. Please try it later.");
+
+  Klass* k = SystemDictionary::resolve_or_fail(vmSymbols::com_alibaba_jwarmup_JWarmUp(), true, CHECK);
+  instanceKlassHandle ik (THREAD, k);
+  if (ik->should_be_initialized()) {
+    ik->initialize(THREAD);
+  }
+  if (HAS_PENDING_EXCEPTION) {
+    java_lang_Throwable::print(PENDING_EXCEPTION, output());
+    output()->cr();
+    CLEAR_PENDING_EXCEPTION;
+    return;
+  }
+
+  if (_notify_startup.value()) {
+    if (!CompilationWarmUp) {
+      output()->print_cr("CompilationWarmUp is off, "
+                         "notifyApplicationStartUpIsDone is invalid");
+      return;
+    }
+
+    JavaValue result(T_VOID);
+    JavaCalls::call_static(&result, ik, vmSymbols::jwarmup_notify_application_startup_is_done_name(), vmSymbols::void_method_signature(), THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      java_lang_Throwable::print(PENDING_EXCEPTION, output());
+      output()->cr();
+      CLEAR_PENDING_EXCEPTION;
+      return;
+    }
+  } else if (_check_compile_finished.value()) {
+    if (!CompilationWarmUp) {
+      output()->print_cr("CompilationWarmUp is off, "
+                         "checkIfCompilationIsComplete is invalid");
+      return;
+    }
+
+    JavaValue result(T_BOOLEAN);
+    JavaCalls::call_static(&result, ik, vmSymbols::jwarmup_check_if_compilation_is_complete_name(), vmSymbols::void_boolean_signature(), THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      java_lang_Throwable::print(PENDING_EXCEPTION, output());
+      output()->cr();
+      CLEAR_PENDING_EXCEPTION;
+      return;
+    }
+
+    if (result.get_jboolean()) {
+      output()->print_cr("Last compilation task is completed.");
+    } else {
+      output()->print_cr("Last compilation task is not completed.");
+    }
+  } else if (_deopt.value()) {
+    if (!(CompilationWarmUp && CompilationWarmUpExplicitDeopt)) {
+      output()->print_cr("CompilationWarmUp or CompilationWarmUpExplicitDeopt is off, "
+                         "notifyJVMDeoptWarmUpMethods is invalid");
+      return;
+    }
+
+    JavaValue result(T_VOID);
+    JavaCalls::call_static(&result, ik, vmSymbols::jwarmup_notify_jvm_deopt_warmup_methods_name(), vmSymbols::void_method_signature(), THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      java_lang_Throwable::print(PENDING_EXCEPTION, output());
+      output()->cr();
+      CLEAR_PENDING_EXCEPTION;
+      return;
+    }
+  } else if (_help.value()) {
+    print_info();
+  } else {
+    print_info();
+  }
+}
+
+void JWarmupDCmd::print_info() {
+    output()->print_cr("The following commands are available:\n"
+                       "-notify: %s\n"
+                       "-check: %s\n"
+                       "-deopt: %s\n"
+                       "-help: %s\n",
+                       _notify_startup.description(), _check_compile_finished.description(), _deopt.description(), _help.description());
+}
+
+ElasticHeapDCmd::ElasticHeapDCmd(outputStream* output, bool heap) :
+                           DCmdWithParser(output, heap),
+    _young_commit_percent("young_commit_percent",
+                          "Percentage of committed size in young generation to be adjusted to",
+                          "INT", false),
+    _uncommit_ihop("uncommit_ihop",
+                   "Percentage of heap to trigger concurrent mark to uncommit memory",
+                   "INT", false),
+    _softmx_percent("softmx_percent",
+                         "Percentage of committed size of heap to be adjusted to",
+                         "INT", false) {
+  _dcmdparser.add_dcmd_option(&_young_commit_percent);
+  _dcmdparser.add_dcmd_option(&_uncommit_ihop);
+  _dcmdparser.add_dcmd_option(&_softmx_percent);
+}
+
+int ElasticHeapDCmd::num_arguments() {
+  ResourceMark rm;
+  int num_args = 0;
+  ElasticHeapDCmd* dcmd = new ElasticHeapDCmd(NULL, false);
+
+  if (dcmd != NULL) {
+    DCmdMark mark(dcmd);
+    num_args = dcmd->_dcmdparser.num_arguments();
+  }
+
+  return num_args;
+}
+
+bool ElasticHeapDCmd::illegal_percent(uint percent, const char* name) {
+  if (percent > 100) {
+    output()->print_cr("Error: %s between 0 and 100.", name);
+    print_info();
+    return true;
+  }
+  return false;
+}
+
+void ElasticHeapDCmd::execute(DCmdSource source, TRAPS) {
+  if (!G1ElasticHeap) {
+    output()->print_cr("Error: -XX:+G1ElasticHeap is not enabled!");
+    return;
+  }
+
+  uint young_percent= ElasticHeap::ignore_arg();
+  uint uncommit_ihop = ElasticHeap::ignore_arg();
+  uint softmx_percent = ElasticHeap::ignore_arg();
+  bool option_set = false;
+
+  if (_young_commit_percent.is_set()) {
+    young_percent = _young_commit_percent.value();
+    option_set = true;
+  }
+  if (_uncommit_ihop.is_set()) {
+    uncommit_ihop = _uncommit_ihop.value();
+    if (illegal_percent(uncommit_ihop, "uncommit_ihop")) {
+      return;
+    }
+    option_set = true;
+  }
+  if (_softmx_percent.is_set()) {
+    if (_young_commit_percent.is_set() || _uncommit_ihop.is_set()) {
+      output()->print_cr("Error: softmx_percent should be set alone!");
+      print_info();
+      return;
+    }
+    softmx_percent = _softmx_percent.value();
+    if (illegal_percent(softmx_percent, "softmx_percent")) {
+      return;
+    }
+    option_set = true;
+  }
+
+  if (option_set) {
+    ElasticHeap::ErrorType error = G1CollectedHeap::heap()->elastic_heap()->configure_setting(young_percent, uncommit_ihop, softmx_percent);
+    if (error == ElasticHeap::IllegalMode) {
+      output()->print_cr("Error: not in correct mode.");
+    } else if (error == ElasticHeap::IllegalYoungPercent) {
+      output()->print_cr("Error: young_commit_percent should be 0, or between %d and 100", ElasticHeapMinYoungCommitPercent);
+    } else if (error != ElasticHeap::NoError) {
+      output()->print_cr("Error: command fails because %s", ElasticHeap::to_string(error));
+    } else {
+      // Success
+    }
+  }
+  print_info();
+}
+
+void ElasticHeapDCmd::print_info() {
+  uint percent;
+  jlong uncommitted_bytes;
+  ElasticHeap::EvaluationMode mode = G1CollectedHeap::heap()->elastic_heap()->evaluation_mode();
+  switch (mode) {
+    case ElasticHeap::InactiveMode:
+      output()->print_cr("[GC.elastic_heap: inactive]");
+      break;
+    case ElasticHeap::SoftmxMode:
+      output()->print_cr("[GC.elastic_heap: in %s mode]", ElasticHeap::to_string(mode));
+      percent = G1CollectedHeap::heap()->elastic_heap()->softmx_percent();
+      uncommitted_bytes = G1CollectedHeap::heap()->elastic_heap()->uncommitted_bytes();
+      output()->print_cr("[GC.elastic_heap: softmx percent %d, uncommitted memory %ld B]", percent, uncommitted_bytes);
+      break;
+    default:
+      output()->print_cr("[GC.elastic_heap: in %s mode]", ElasticHeap::to_string(mode));
+      percent = G1CollectedHeap::heap()->elastic_heap()->young_commit_percent();
+      uncommitted_bytes = G1CollectedHeap::heap()->elastic_heap()->young_uncommitted_bytes();
+      output()->print_cr("[GC.elastic_heap: young generation commit percent %d, uncommitted memory %ld B]", percent, uncommitted_bytes);
+      break;
   }
 }

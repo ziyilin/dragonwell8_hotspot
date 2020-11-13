@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2014, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,222 +27,9 @@
 #include "gc_implementation/g1/g1GCPhaseTimes.hpp"
 #include "gc_implementation/g1/g1Log.hpp"
 #include "gc_implementation/g1/g1StringDedup.hpp"
+#include "gc_implementation/shared/workerDataArray.inline.hpp"
 #include "memory/allocation.hpp"
 #include "runtime/os.hpp"
-
-// Helper class for avoiding interleaved logging
-class LineBuffer: public StackObj {
-
-private:
-  static const int BUFFER_LEN = 1024;
-  static const int INDENT_CHARS = 3;
-  char _buffer[BUFFER_LEN];
-  int _indent_level;
-  int _cur;
-
-  void vappend(const char* format, va_list ap)  ATTRIBUTE_PRINTF(2, 0) {
-    int res = os::vsnprintf(&_buffer[_cur], BUFFER_LEN - _cur, format, ap);
-    if (res > BUFFER_LEN) {
-      DEBUG_ONLY(warning("buffer too small in LineBuffer");)
-      _buffer[BUFFER_LEN -1] = 0;
-      _cur = BUFFER_LEN; // vsnprintf above should not add to _buffer if we are called again
-    } else if (res != -1) {
-      _cur += res;
-    }
-  }
-
-public:
-  explicit LineBuffer(int indent_level): _indent_level(indent_level), _cur(0) {
-    for (; (_cur < BUFFER_LEN && _cur < (_indent_level * INDENT_CHARS)); _cur++) {
-      _buffer[_cur] = ' ';
-    }
-  }
-
-#ifndef PRODUCT
-  ~LineBuffer() {
-    assert(_cur == _indent_level * INDENT_CHARS, "pending data in buffer - append_and_print_cr() not called?");
-  }
-#endif
-
-  void append(const char* format, ...)  ATTRIBUTE_PRINTF(2, 3) {
-    va_list ap;
-    va_start(ap, format);
-    vappend(format, ap);
-    va_end(ap);
-  }
-
-  void print_cr() {
-    gclog_or_tty->print_cr("%s", _buffer);
-    _cur = _indent_level * INDENT_CHARS;
-  }
-
-  void append_and_print_cr(const char* format, ...)  ATTRIBUTE_PRINTF(2, 3) {
-    va_list ap;
-    va_start(ap, format);
-    vappend(format, ap);
-    va_end(ap);
-    print_cr();
-  }
-};
-
-template <class T>
-class WorkerDataArray  : public CHeapObj<mtGC> {
-  friend class G1GCParPhasePrinter;
-  T*          _data;
-  uint        _length;
-  const char* _title;
-  bool        _print_sum;
-  int         _log_level;
-  uint        _indent_level;
-  bool        _enabled;
-
-  WorkerDataArray<size_t>* _thread_work_items;
-
-  NOT_PRODUCT(T uninitialized();)
-
-  // We are caching the sum and average to only have to calculate them once.
-  // This is not done in an MT-safe way. It is intended to allow single
-  // threaded code to call sum() and average() multiple times in any order
-  // without having to worry about the cost.
-  bool   _has_new_data;
-  T      _sum;
-  T      _min;
-  T      _max;
-  double _average;
-
- public:
-  WorkerDataArray(uint length, const char* title, bool print_sum, int log_level, uint indent_level) :
-    _title(title), _length(0), _print_sum(print_sum), _log_level(log_level), _indent_level(indent_level),
-    _has_new_data(true), _thread_work_items(NULL), _enabled(true) {
-    assert(length > 0, "Must have some workers to store data for");
-    _length = length;
-    _data = NEW_C_HEAP_ARRAY(T, _length, mtGC);
-  }
-
-  ~WorkerDataArray() {
-    FREE_C_HEAP_ARRAY(T, _data, mtGC);
-  }
-
-  void link_thread_work_items(WorkerDataArray<size_t>* thread_work_items) {
-    _thread_work_items = thread_work_items;
-  }
-
-  WorkerDataArray<size_t>* thread_work_items() { return _thread_work_items; }
-
-  void set(uint worker_i, T value) {
-    assert(worker_i < _length, err_msg("Worker %d is greater than max: %d", worker_i, _length));
-    assert(_data[worker_i] == WorkerDataArray<T>::uninitialized(), err_msg("Overwriting data for worker %d in %s", worker_i, _title));
-    _data[worker_i] = value;
-    _has_new_data = true;
-  }
-
-  void set_thread_work_item(uint worker_i, size_t value) {
-    assert(_thread_work_items != NULL, "No sub count");
-    _thread_work_items->set(worker_i, value);
-  }
-
-  T get(uint worker_i) {
-    assert(worker_i < _length, err_msg("Worker %d is greater than max: %d", worker_i, _length));
-    assert(_data[worker_i] != WorkerDataArray<T>::uninitialized(), err_msg("No data added for worker %d", worker_i));
-    return _data[worker_i];
-  }
-
-  void add(uint worker_i, T value) {
-    assert(worker_i < _length, err_msg("Worker %d is greater than max: %d", worker_i, _length));
-    assert(_data[worker_i] != WorkerDataArray<T>::uninitialized(), err_msg("No data to add to for worker %d", worker_i));
-    _data[worker_i] += value;
-    _has_new_data = true;
-  }
-
-  double average(uint active_threads){
-    calculate_totals(active_threads);
-    return _average;
-  }
-
-  T sum(uint active_threads) {
-    calculate_totals(active_threads);
-    return _sum;
-  }
-
-  T minimum(uint active_threads) {
-    calculate_totals(active_threads);
-    return _min;
-  }
-
-  T maximum(uint active_threads) {
-    calculate_totals(active_threads);
-    return _max;
-  }
-
-  void reset() PRODUCT_RETURN;
-  void verify(uint active_threads) PRODUCT_RETURN;
-
-  void set_enabled(bool enabled) { _enabled = enabled; }
-
-  int log_level() { return _log_level;  }
-
- private:
-
-  void calculate_totals(uint active_threads){
-    if (!_has_new_data) {
-      return;
-    }
-
-    _sum = (T)0;
-    _min = _data[0];
-    _max = _min;
-    assert(active_threads <= _length, "Wrong number of active threads");
-    for (uint i = 0; i < active_threads; ++i) {
-      T val = _data[i];
-      _sum += val;
-      _min = MIN2(_min, val);
-      _max = MAX2(_max, val);
-    }
-    _average = (double)_sum / (double)active_threads;
-    _has_new_data = false;
-  }
-};
-
-
-#ifndef PRODUCT
-
-template <>
-size_t WorkerDataArray<size_t>::uninitialized() {
-  return (size_t)-1;
-}
-
-template <>
-double WorkerDataArray<double>::uninitialized() {
-  return -1.0;
-}
-
-template <class T>
-void WorkerDataArray<T>::reset() {
-  for (uint i = 0; i < _length; i++) {
-    _data[i] = WorkerDataArray<T>::uninitialized();
-  }
-  if (_thread_work_items != NULL) {
-    _thread_work_items->reset();
-  }
-}
-
-template <class T>
-void WorkerDataArray<T>::verify(uint active_threads) {
-  if (!_enabled) {
-    return;
-  }
-
-  assert(active_threads <= _length, "Wrong number of active threads");
-  for (uint i = 0; i < active_threads; i++) {
-    assert(_data[i] != WorkerDataArray<T>::uninitialized(),
-        err_msg("Invalid data for worker %u in '%s'", i, _title));
-  }
-  if (_thread_work_items != NULL) {
-    _thread_work_items->verify(active_threads);
-  }
-}
-
-#endif
 
 G1GCPhaseTimes::G1GCPhaseTimes(uint max_gc_threads) :
   _max_gc_threads(max_gc_threads)
@@ -290,6 +77,9 @@ G1GCPhaseTimes::G1GCPhaseTimes(uint max_gc_threads) :
   _gc_par_phases[RedirtyCards] = new WorkerDataArray<double>(max_gc_threads, "Parallel Redirty", true, G1Log::LevelFinest, 3);
   _redirtied_cards = new WorkerDataArray<size_t>(max_gc_threads, "Redirtied Cards", true, G1Log::LevelFinest, 3);
   _gc_par_phases[RedirtyCards]->link_thread_work_items(_redirtied_cards);
+
+  // Cannot guard below line with TenantHeapIsolation since we do not have conditional compilation for tenant mode
+  _gc_par_phases[TenantAllocationContextRoots] = new WorkerDataArray<double>(max_gc_threads, "G1TenantAllocationContext Roots (ms)", true, G1Log::LevelFinest, 3);
 }
 
 void G1GCPhaseTimes::note_gc_start(uint active_gc_threads, bool mark_in_progress) {
@@ -303,6 +93,8 @@ void G1GCPhaseTimes::note_gc_start(uint active_gc_threads, bool mark_in_progress
 
   _gc_par_phases[StringDedupQueueFixup]->set_enabled(G1StringDedup::is_enabled());
   _gc_par_phases[StringDedupTableFixup]->set_enabled(G1StringDedup::is_enabled());
+
+  _gc_par_phases[TenantAllocationContextRoots]->set_enabled(TenantHeapIsolation);
 }
 
 void G1GCPhaseTimes::note_gc_end() {
@@ -583,13 +375,12 @@ void G1GCPhaseTimes::print(double pause_time_sec) {
 G1GCParPhaseTimesTracker::G1GCParPhaseTimesTracker(G1GCPhaseTimes* phase_times, G1GCPhaseTimes::GCParPhases phase, uint worker_id) :
     _phase_times(phase_times), _phase(phase), _worker_id(worker_id) {
   if (_phase_times != NULL) {
-    _start_time = os::elapsedTime();
+    _start_time = Ticks::now();
   }
 }
 
 G1GCParPhaseTimesTracker::~G1GCParPhaseTimesTracker() {
   if (_phase_times != NULL) {
-    _phase_times->record_time_secs(_phase, _worker_id, os::elapsedTime() - _start_time);
+    _phase_times->record_time_secs(_phase, _worker_id, (Ticks::now() - _start_time).seconds());
   }
 }
-

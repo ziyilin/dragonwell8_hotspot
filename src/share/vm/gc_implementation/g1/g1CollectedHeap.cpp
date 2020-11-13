@@ -67,6 +67,8 @@
 #include "oops/oop.pcgc.inline.hpp"
 #include "runtime/orderAccess.inline.hpp"
 #include "runtime/vmThread.hpp"
+#include "gc_implementation/g1/elasticHeap.hpp"
+#include "gc_implementation/g1/g1TenantAllocationContext.hpp"
 
 size_t G1CollectedHeap::_humongous_object_threshold_in_words = 0;
 
@@ -744,6 +746,12 @@ HeapWord* G1CollectedHeap::humongous_obj_allocate(size_t word_size, AllocationCo
 
   verify_region_sets_optional();
 
+  // early return if exceeds tenant limit
+  if (TenantHeapThrottling && !context.is_system()
+      && !context->can_allocate(word_size)) {
+    return NULL;
+  }
+
   uint first = G1_NO_HRM_INDEX;
   uint obj_regions = (uint)(align_size_up_(word_size, HeapRegion::GrainWords) / HeapRegion::GrainWords);
 
@@ -775,7 +783,8 @@ HeapWord* G1CollectedHeap::humongous_obj_allocate(size_t word_size, AllocationCo
     }
   }
 
-  if (first == G1_NO_HRM_INDEX) {
+  // With G1ElasticHeap we don't allocate from (elastic) unavailable regions
+  if (first == G1_NO_HRM_INDEX && !G1ElasticHeap) {
     // Policy: We could not find enough regions for the humongous object in the
     // free list. Look through the heap to find a mix of free and uncommitted regions.
     // If so, try expansion.
@@ -847,6 +856,14 @@ G1CollectedHeap::mem_allocate(size_t word_size,
     } else {
       result = attempt_allocation_humongous(word_size, &gc_count_before, &gclocker_retry_count);
     }
+
+#ifndef PRODUCT
+    if (TenantHeapIsolation && TraceNonRootTenantAllocation && !AllocationContext::current().is_system()) {
+      tty->print_cr("Non-root allocation: " SIZE_FORMAT " bytes @0x" PTR_FORMAT " in tenant 0x" PTR_FORMAT,
+                    word_size * HeapWordSize, result, AllocationContext::current().tenant_allocation_context());
+    }
+#endif
+
     if (result != NULL) {
       return result;
     }
@@ -1289,12 +1306,32 @@ bool G1CollectedHeap::do_collection(bool explicit_gc,
     TraceCPUTime tcpu(G1Log::finer(), true, gclog_or_tty);
 
     {
-      GCTraceTime t(GCCauseString("Full GC", gc_cause()), G1Log::fine(), true, NULL, gc_tracer->gc_id());
+      GCCauseString cause_string("Full GC", gc_cause());
+      if (TenantHeapIsolation && !gc_cause_context().is_system()) {
+        cause_string.append(FormatBuffer<>(" (tenant-%ld)",
+                                           com_alibaba_tenant_TenantContainer::get_tenant_id(gc_cause_context()->tenant_container())));
+      }
+      GCTraceTime t(cause_string, G1Log::fine(), true, NULL, gc_tracer->gc_id());
       TraceCollectorStats tcs(g1mm()->full_collection_counters());
       TraceMemoryManagerStats tms(true /* fullGC */, gc_cause());
 
       double start = os::elapsedTime();
       g1_policy()->record_full_collection_start();
+
+      // With ElasticHeap, we may wait to finish some work
+      if (G1ElasticHeap) {
+        elastic_heap()->record_gc_start(true);
+        if (explicit_gc) {
+          // In explicit full gc, wait for conc cycle to finish
+          elastic_heap()->wait_for_conc_cycle_end();
+        } else {
+         if (ElasticHeapPeriodicUncommit) {
+          // If not explicit full gc and in elastic heap periodic GC mode
+          // recover the uncommitted regions
+          elastic_heap()->wait_to_recover();
+         }
+        }
+      }
 
       // Note: When we have a more flexible GC logging framework that
       // allows us to add optional attributes to a GC log record we
@@ -1538,6 +1575,10 @@ bool G1CollectedHeap::do_collection(bool explicit_gc,
 
     post_full_gc_dump(gc_timer);
 
+    if (G1ElasticHeap) {
+      elastic_heap()->record_gc_end();
+    }
+
     gc_timer->register_gc_end();
     gc_tracer->report_gc_end(gc_timer->gc_end(), gc_timer->time_partitions());
   }
@@ -1560,6 +1601,10 @@ void G1CollectedHeap::do_full_collection(bool clear_all_soft_refs) {
 void
 G1CollectedHeap::
 resize_if_necessary_after_full_collection(size_t word_size) {
+  if (G1ElasticHeap) {
+    // We never resize heap in full GC with elastic heap
+    return;
+  }
   // Include the current allocation, if any, and bytes that will be
   // pre-allocated to support collections, as "used".
   const size_t used_after_gc = used();
@@ -1762,6 +1807,11 @@ bool G1CollectedHeap::expand(size_t expand_bytes) {
     return false;
   }
 
+  if (G1ElasticHeap && G1CollectedHeap::heap()->elastic_heap() != NULL) {
+    // Heap initialization completes. Don't expand ever.
+    return false;
+  }
+
   uint regions_to_expand = (uint)(aligned_expand_bytes / HeapRegion::GrainBytes);
   assert(regions_to_expand > 0, "Must expand by at least one region");
 
@@ -1860,6 +1910,7 @@ G1CollectedHeap::G1CollectedHeap(G1CollectorPolicy* policy_) :
   _has_humongous_reclaim_candidates(false),
   _free_regions_coming(false),
   _young_list(new YoungList(this)),
+  _elastic_heap(NULL),
   _gc_time_stamp(0),
   _survivor_plab_stats(YoungPLABSize, PLABWeight),
   _old_plab_stats(OldPLABSize, PLABWeight),
@@ -1941,6 +1992,11 @@ jint G1CollectedHeap::initialize() {
   // it will be used then.
   _hr_printer.set_active(G1PrintHeapRegions);
 
+  // have to do this early before mutator_alloc_region initialization
+  if (TenantHeapIsolation) {
+    G1TenantAllocationContexts::initialize();
+  }
+
   // While there are no constraints in the GC code that HeapWordSize
   // be any particular value, there are multiple other areas in the
   // system which believe this to be true (e.g. oop->object_size in some
@@ -1951,6 +2007,19 @@ jint G1CollectedHeap::initialize() {
   size_t init_byte_size = collector_policy()->initial_heap_byte_size();
   size_t max_byte_size = collector_policy()->max_heap_byte_size();
   size_t heap_alignment = collector_policy()->heap_alignment();
+
+  if (G1ElasticHeap) {
+    size_t page_size = UseLargePages ? os::large_page_size() : os::vm_page_size();
+    if (HeapRegion::GrainBytes < page_size || (HeapRegion::GrainBytes % page_size) != 0) {
+      vm_exit_during_initialization(err_msg("G1ElasticHeap requires G1HeapRegionSize("
+                                            SIZE_FORMAT
+                                            " bytes) is multiple times of OS page size("
+                                            SIZE_FORMAT
+                                            " bytes)",
+                                             HeapRegion::GrainBytes, page_size));
+      return JNI_EINVAL;
+    }
+  }
 
   // Ensure that the sizes are properly aligned.
   Universe::check_alignment(init_byte_size, HeapRegion::GrainBytes, "g1 heap");
@@ -2081,6 +2150,10 @@ jint G1CollectedHeap::initialize() {
   // Perform any initialization actions delegated to the policy.
   g1_policy()->init();
 
+  if (G1ElasticHeap) {
+    _elastic_heap = new ElasticHeap(this);
+  }
+
   JavaThread::satb_mark_queue_set().initialize(SATB_Q_CBL_mon,
                                                SATB_Q_FL_lock,
                                                G1SATBProcessCompletedThreshold,
@@ -2145,6 +2218,9 @@ void G1CollectedHeap::stop() {
   // that are destroyed during shutdown.
   _cg1r->stop();
   _cmThread->stop();
+  if (G1ElasticHeap) {
+    elastic_heap()->destroy();
+  }
   if (G1StringDedup::is_enabled()) {
     G1StringDedup::stop();
   }
@@ -2528,6 +2604,7 @@ void G1CollectedHeap::collect(GCCause::Cause cause) {
       return;
     } else {
       if (cause == GCCause::_gc_locker || cause == GCCause::_wb_young_gc
+          || cause == GCCause::_g1_elastic_heap_trigger_gc
           DEBUG_ONLY(|| cause == GCCause::_scavenge_alot)) {
 
         // Schedule a standard evacuation pause. We're setting word_size
@@ -2541,6 +2618,9 @@ void G1CollectedHeap::collect(GCCause::Cause cause) {
       } else {
         // Schedule a Full GC.
         VM_G1CollectFull op(gc_count_before, full_gc_count_before, cause);
+        if (TenantHeapIsolation) {
+          op.set_allocation_context(AllocationContext::current());
+        }
         VMThread::execute(&op);
       }
     }
@@ -3579,6 +3659,28 @@ void G1CollectedHeap::print_all_rsets() {
 }
 #endif // PRODUCT
 
+G1HeapSummary G1CollectedHeap::create_g1_heap_summary() {
+
+  size_t eden_used_bytes = _young_list->eden_used_bytes();
+  size_t survivor_used_bytes = _young_list->survivor_used_bytes();
+  size_t heap_used = Heap_lock->owned_by_self() ? used() : used_unlocked();
+
+  size_t eden_capacity_bytes =
+    (g1_policy()->young_list_target_length() * HeapRegion::GrainBytes) - survivor_used_bytes;
+
+  VirtualSpaceSummary heap_summary = create_heap_space_summary();
+  return G1HeapSummary(heap_summary, heap_used, eden_used_bytes,
+                       eden_capacity_bytes, survivor_used_bytes, num_regions());
+}
+
+void G1CollectedHeap::trace_heap(GCWhen::Type when, GCTracer* gc_tracer) {
+  const G1HeapSummary& heap_summary = create_g1_heap_summary();
+  gc_tracer->report_gc_heap_summary(when, heap_summary);
+
+  const MetaspaceSummary& metaspace_summary = create_metaspace_summary();
+  gc_tracer->report_metaspace_summary(when, metaspace_summary);
+}
+
 G1CollectedHeap* G1CollectedHeap::heap() {
   assert(_sh->kind() == CollectedHeap::G1CollectedHeap,
          "not a garbage-first heap");
@@ -3920,6 +4022,10 @@ void G1CollectedHeap::log_gc_header() {
   GCCauseString gc_cause_str = GCCauseString("GC pause", gc_cause())
     .append(g1_policy()->gcs_are_young() ? "(young)" : "(mixed)")
     .append(g1_policy()->during_initial_mark_pause() ? " (initial-mark)" : "");
+  if (TenantHeapIsolation && !gc_cause_context().is_system()) {
+    gc_cause_str.append(FormatBuffer<>(" (tenant-%ld)",
+                                       com_alibaba_tenant_TenantContainer::get_tenant_id(gc_cause_context()->tenant_container())));
+  }
 
   gclog_or_tty->print("[%s", (const char*)gc_cause_str);
 }
@@ -4039,6 +4145,10 @@ G1CollectedHeap::do_collection_pause_at_safepoint(double target_pause_time_ms) {
     { // Call to jvmpi::post_class_unload_events must occur outside of active GC
       IsGCActiveMark x;
 
+      if (G1ElasticHeap) {
+        elastic_heap()->prepare_in_gc_start();
+      }
+
       gc_prologue(false);
       increment_total_collections(false /* full gc */);
       increment_gc_time_stamp();
@@ -4096,7 +4206,7 @@ G1CollectedHeap::do_collection_pause_at_safepoint(double target_pause_time_ms) {
         g1_policy()->print_collection_set(g1_policy()->inc_cset_head(), gclog_or_tty);
 #endif // YOUNG_LIST_VERBOSE
 
-        g1_policy()->record_collection_pause_start(sample_start_time_sec);
+        g1_policy()->record_collection_pause_start(sample_start_time_sec, *_gc_tracer_stw);
 
         double scan_wait_start = os::elapsedTime();
         // We have to wait until the CM threads finish scanning the
@@ -4249,6 +4359,10 @@ G1CollectedHeap::do_collection_pause_at_safepoint(double target_pause_time_ms) {
         // has just got initialized after the previous CSet was freed.
         _cm->verify_no_cset_oops();
         _cm->note_end_of_gc();
+
+        if (G1ElasticHeap) {
+          elastic_heap()->perform();
+        }
 
         // This timing is only used by the ergonomics to handle our pause target.
         // It is unclear why this should not include the full pause. We will
@@ -7000,4 +7114,42 @@ public:
 void G1CollectedHeap::rebuild_strong_code_roots() {
   RebuildStrongCodeRootClosure blob_cl(this);
   CodeCache::blobs_do(&blob_cl);
+}
+
+void G1CollectedHeap::create_tenant_allocation_context(oop tenant_obj) {
+  assert(TenantHeapIsolation, "pre-condition");
+  assert(tenant_obj != NULL, "Tenant container object is null");
+
+  G1TenantAllocationContext* context = new (mtTenant) G1TenantAllocationContext(this);
+  assert(NULL != context, "Failed to create tenant context");
+
+  com_alibaba_tenant_TenantContainer::set_tenant_allocation_context(tenant_obj, context);
+  context->set_tenant_container(tenant_obj);
+}
+
+void G1CollectedHeap::destroy_tenant_allocation_context(jlong context_val) {
+  assert(TenantHeapIsolation, "pre-condition");
+  G1TenantAllocationContext* context = (G1TenantAllocationContext*)context_val;
+  assert(NULL != context, "Delete an uninitialized tenant container");
+  oop tenant_obj = context->tenant_container();
+  assert(tenant_obj != NULL, "TenantContainer object cannot be NULL");
+  delete context;
+  com_alibaba_tenant_TenantContainer::set_tenant_allocation_context(tenant_obj, NULL);
+}
+
+oop G1CollectedHeap::tenant_container_of(oop obj) {
+  assert(TenantHeapIsolation, "pre-condition");
+
+  if (obj != NULL) {
+    // Get: oop-> object address-> heap region -> tenant allocation context -> tenant obj
+    // assert obj
+    HeapRegion* hr = _hrm.addr_to_region((HeapWord*)obj);
+    if (NULL != hr) {
+      const G1TenantAllocationContext* context = hr->tenant_allocation_context();
+      if (NULL != context) {
+        return context->tenant_container();
+      }
+    }
+  }
+  return NULL;
 }

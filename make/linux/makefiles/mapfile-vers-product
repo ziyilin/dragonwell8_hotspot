@@ -39,7 +39,10 @@ SUNWprivate_1.1 {
                 JVM_ArrayCopy;
                 JVM_AssertionStatusDirectives;
                 JVM_Available;
+                JVM_BeforeHalt;
                 JVM_Bind;
+                JVM_CheckAndClearNativeInterruptForWisp;
+                JVM_CheckJWarmUpCompilationIsComplete;
                 JVM_ClassDepth;
                 JVM_ClassLoaderDepth;
                 JVM_Clone;
@@ -83,6 +86,15 @@ SUNWprivate_1.1 {
                 JVM_DumpAllStacks;
                 JVM_DumpThreads;
                 JVM_EnableCompiler;
+                JVM_ElasticHeapGetEvaluationMode;
+                JVM_ElasticHeapSetYoungGenCommitPercent;
+                JVM_ElasticHeapGetYoungGenCommitPercent;
+                JVM_ElasticHeapSetUncommitIHOP;
+                JVM_ElasticHeapGetUncommitIHOP;
+                JVM_ElasticHeapGetTotalYoungUncommittedBytes;
+                JVM_ElasticHeapSetSoftmxPercent;
+                JVM_ElasticHeapGetSoftmxPercent;
+                JVM_ElasticHeapGetTotalUncommittedBytes;
                 JVM_Exit;
                 JVM_FillInStackTrace;
                 JVM_FindClassFromCaller;
@@ -158,6 +170,7 @@ SUNWprivate_1.1 {
                 JVM_GetMethodTypeAnnotations;
                 JVM_GetPrimitiveArrayElement;
                 JVM_GetProtectionDomain;
+                JVM_GetProxyUnpark;
                 JVM_GetSockName;
                 JVM_GetSockOpt;
                 JVM_GetStackAccessControlContext;
@@ -181,9 +194,11 @@ SUNWprivate_1.1 {
                 JVM_InvokeMethod;
                 JVM_IsArrayClass;
                 JVM_IsConstructorIx;
+                JVM_IsInSameNative;
                 JVM_IsInterface;
                 JVM_IsInterrupted;
                 JVM_IsNaN;
+                JVM_IsUseContainerSupport;
                 JVM_IsPrimitiveClass;
                 JVM_IsSameClassPackage;
                 JVM_IsSilentCompiler;
@@ -195,6 +210,7 @@ SUNWprivate_1.1 {
                 JVM_LoadClass0;
                 JVM_LoadLibrary;
                 JVM_Lseek;
+                JVM_MarkPreempted;
                 JVM_MaxObjectInspectionAge;
                 JVM_MaxMemory;
                 JVM_MonitorNotify;
@@ -205,6 +221,8 @@ SUNWprivate_1.1 {
                 JVM_NewArray;
                 JVM_NewInstanceFromConstructor;
                 JVM_NewMultiArray;
+                JVM_NotifyApplicationStartUpIsDone;
+                JVM_NotifyJVMDeoptWarmUpMethods;
                 JVM_OnExit;
                 JVM_Open;
                 JVM_RaiseSignal;
@@ -231,6 +249,7 @@ SUNWprivate_1.1 {
                 JVM_SetPrimitiveArrayElement;
                 JVM_SetSockOpt;
                 JVM_SetThreadPriority;
+                JVM_SetWispTask;
                 JVM_Sleep;
                 JVM_Socket;
                 JVM_SocketAvailable;
@@ -267,6 +286,12 @@ SUNWprivate_1.1 {
                 AsyncGetCallTrace;
 
 		# INSERT VTABLE SYMBOLS HERE
+
+                JVM_TenantContainerOf;
+                JVM_AttachToTenant;
+                JVM_CreateTenantAllocationContext;
+                JVM_DestroyTenantAllocationContext;
+                JVM_GetTenantOccupiedMemory;
 
         local:
                 *;

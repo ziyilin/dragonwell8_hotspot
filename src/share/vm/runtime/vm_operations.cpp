@@ -37,7 +37,6 @@
 #include "runtime/thread.inline.hpp"
 #include "runtime/vm_operations.hpp"
 #include "services/threadService.hpp"
-#include "trace/tracing.hpp"
 
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
 
@@ -324,6 +323,25 @@ void VM_ThreadDump::doit() {
       }
       ThreadSnapshot* ts = snapshot_thread(jt, tcl);
       _result->add_thread_snapshot(ts);
+
+      if (EnableCoroutine) {
+        for (Coroutine* co = jt->coroutine_list()->next();
+            co != jt->coroutine_list(); co = co->next()) {
+          oop tw = com_alibaba_wisp_engine_WispTask::get_threadWrapper(co->wisp_task());
+          // skip exited wisp threads
+          if (tw == NULL) {
+            continue;
+          }
+          co->wisp_thread()->set_threadObj(tw);
+
+          ThreadConcurrentLocks* wtcl = NULL;
+          if (_with_locked_synchronizers) {
+            wtcl = concurrent_locks.thread_concurrent_locks(co->wisp_thread());
+          }
+          ThreadSnapshot* wts = snapshot_coroutine(co, wtcl);
+          _result->add_thread_snapshot(wts);
+        }
+      }
     }
   } else {
     // Snapshot threads in the given _threads array
@@ -335,6 +353,29 @@ void VM_ThreadDump::doit() {
         // Add a dummy snapshot
         _result->add_thread_snapshot(new ThreadSnapshot());
         continue;
+      }
+
+      if (EnableCoroutine) {
+        jlong id = java_lang_Thread::thread_id(th());
+        // this would traverse thread's coroutine list
+        JavaThread* jt = Threads::find_java_thread_from_java_tid(id);
+        if (jt->is_Wisp_thread()) {
+          Coroutine* co = ((WispThread*)jt)->coroutine();
+          oop tw = com_alibaba_wisp_engine_WispTask::get_threadWrapper(co->wisp_task());
+          // skip exited wisp threads
+          if (tw == NULL) {
+            continue;
+          }
+          co->wisp_thread()->set_threadObj(tw);
+
+          ThreadConcurrentLocks* wtcl = NULL;
+          if (_with_locked_synchronizers) {
+            wtcl = concurrent_locks.thread_concurrent_locks(co->wisp_thread());
+          }
+          ThreadSnapshot* wts = snapshot_coroutine(co, wtcl);
+          _result->add_thread_snapshot(wts);
+          return;
+        }
       }
 
       // Dump thread stack only if the thread is alive and not exiting
@@ -363,6 +404,14 @@ ThreadSnapshot* VM_ThreadDump::snapshot_thread(JavaThread* java_thread, ThreadCo
   snapshot->set_concurrent_locks(tcl);
   return snapshot;
 }
+
+ThreadSnapshot* VM_ThreadDump::snapshot_coroutine(Coroutine* coro, ThreadConcurrentLocks* tcl) {
+  ThreadSnapshot* snapshot = new ThreadSnapshot(coro->wisp_thread());
+  snapshot->dump_stack_at_safepoint_for_coroutine(coro, _max_depth, _with_locked_monitors);
+  snapshot->set_concurrent_locks(tcl);
+  return snapshot;
+}
+
 
 volatile bool VM_Exit::_vm_exited = false;
 Thread * VM_Exit::_shutdown_thread = NULL;

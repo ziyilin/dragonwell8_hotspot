@@ -332,6 +332,7 @@ class java_lang_Thread : AllStatic {
   static int _thread_status_offset;
   static int _park_blocker_offset;
   static int _park_event_offset ;
+  static int _inheritedTenantContainer_offset;
 
   static void compute_offsets();
 
@@ -363,6 +364,8 @@ class java_lang_Thread : AllStatic {
   static oop context_class_loader(oop java_thread);
   // Control context
   static oop inherited_access_control_context(oop java_thread);
+  // Tenant container
+  static oop inherited_tenant_container(oop java_thread);
   // Stack size hint
   static jlong stackSize(oop java_thread);
   // Thread ID
@@ -414,6 +417,8 @@ class java_lang_Thread : AllStatic {
   static ThreadStatus get_thread_status(oop java_thread_oop);
 
   static const char*  thread_status_name(oop java_thread_oop);
+
+  static int thread_status_offset() { return _thread_status_offset; }
 
   // Debugging
   friend class JavaClasses;
@@ -518,6 +523,7 @@ class java_lang_Throwable: AllStatic {
   static oop message(oop throwable);
   static oop message(Handle throwable);
   static void set_message(oop throwable, oop value);
+  static Symbol* detail_message(oop throwable);
   static void print_stack_element(outputStream *st, Handle mirror, int method,
                                   int version, int bci, int cpref);
   static void print_stack_element(outputStream *st, methodHandle method, int bci);
@@ -1401,6 +1407,45 @@ class java_util_concurrent_locks_AbstractOwnableSynchronizer : AllStatic {
   static oop  get_owner_threadObj(oop obj);
 };
 
+#if INCLUDE_ALL_GCS
+
+class G1TenantAllocationContext;
+
+class com_alibaba_tenant_TenantContainer : AllStatic {
+private:
+  static int _tenant_id_offset;
+  static int _allocation_context_offset;
+  static int _tenant_state_offset;
+public:
+  static jlong get_tenant_id(oop obj);
+  static G1TenantAllocationContext* get_tenant_allocation_context(oop obj);
+  static void set_tenant_allocation_context(oop obj, G1TenantAllocationContext* context);
+  static oop get_tenant_state(oop obj);
+  static bool is_dead(oop obj);
+  static void compute_offsets();
+};
+
+class com_alibaba_tenant_TenantState : AllStatic {
+  friend class JavaClasses;
+public:
+  // C++ level definition of tenant status
+  enum {
+    TS_STARTING = 0,
+    TS_RUNNING = 1,
+    TS_STOPPING = 2,
+    TS_DEAD = 3,
+    TS_SIZE,
+  };
+
+private:
+  // offsets
+  static int _static_state_offsets[TS_SIZE];
+public:
+  static int state_of(oop tenant_obj);
+};
+
+#endif // INCLUDE_ALL_GCS
+
 // Use to declare fields that need to be injected into Java classes
 // for the JVM to use.  The name_index and signature_index are
 // declared in vmSymbols.  The may_be_java flag is used to declare
@@ -1437,6 +1482,61 @@ class InjectedField {
   CLASS_INJECTED_FIELDS(macro)              \
   CLASSLOADER_INJECTED_FIELDS(macro)        \
   MEMBERNAME_INJECTED_FIELDS(macro)
+
+class java_dyn_CoroutineBase: AllStatic {
+private:
+  // Note that to reduce dependencies on the JDK we compute these offsets at run-time.
+  static int _data_offset;
+
+  static void compute_offsets();
+
+public:
+  // Accessors
+  static jlong data(oop obj);
+  static void set_data(oop obj, jlong value);
+
+  static int get_data_offset()    { return _data_offset; }
+
+  // Debugging
+  friend class JavaClasses;
+};
+
+class com_alibaba_wisp_engine_WispCarrier: AllStatic {
+private:
+  static int _isInCritical_offset;
+public:
+  static jboolean in_critical(oop obj);
+
+  static void compute_offsets();
+};
+
+class com_alibaba_wisp_engine_WispTask: AllStatic {
+private:
+  static int _jvmParkStatus_offset;
+  static int _jdkParkStatus_offset;
+  static int _id_offset;
+  static int _threadWrapper_offset;
+  static int _interrupted_offset;
+  static int _activeCount_offset;
+  static int _stealCount_offset;
+  static int _stealFailureCount_offset;
+  static int _preemptCount_offset;
+public:
+  static void set_jvmParkStatus(oop obj, jint status);
+  static int  get_jvmParkStatus(oop obj);
+  static int  get_jdkParkStatus(oop obj);
+  static int  get_id(oop obj);
+  static oop  get_threadWrapper(oop obj);
+  static int  get_interrupted(oop obj);
+  static void set_interrupted(oop obj, jint interrupted);
+  static int  get_activeCount(oop obj);
+  static int  get_stealCount(oop obj);
+  static int  get_stealFailureCount(oop obj);
+  static int  get_preemptCount(oop obj);
+  static void set_preemptCount(oop obj, jint count);
+
+  static void compute_offsets();
+};
 
 // Interface to hard-coded offset checking
 

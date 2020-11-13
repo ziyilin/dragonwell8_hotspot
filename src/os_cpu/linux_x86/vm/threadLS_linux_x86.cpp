@@ -96,4 +96,5 @@ void ThreadLocalStorage::pd_init() {
 void ThreadLocalStorage::pd_set_thread(Thread* thread) {
   os::thread_local_storage_at_put(ThreadLocalStorage::thread_index(), thread);
 }
+
 #endif // !AMD64 && !MINIMIZE_RAM_USAGE

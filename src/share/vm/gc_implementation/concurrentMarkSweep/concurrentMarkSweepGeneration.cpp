@@ -1928,9 +1928,7 @@ NOT_PRODUCT(
 
     // Has the GC time limit been exceeded?
     DefNewGeneration* young_gen = _young_gen->as_DefNewGeneration();
-    size_t max_eden_size = young_gen->max_capacity() -
-                           young_gen->to()->capacity() -
-                           young_gen->from()->capacity();
+    size_t max_eden_size = young_gen->max_eden_size();
     GenCollectedHeap* gch = GenCollectedHeap::heap();
     GCCause::Cause gc_cause = gch->gc_cause();
     size_policy()->check_gc_overhead_limit(_young_gen->used(),
@@ -3066,6 +3064,8 @@ void CMSCollector::verify_after_remark_work_1() {
   HandleMark  hm;
   GenCollectedHeap* gch = GenCollectedHeap::heap();
 
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
+
   // Get a clear set of claim bits for the roots processing to work with.
   ClassLoaderDataGraph::clear_claimed_marks();
 
@@ -3073,6 +3073,8 @@ void CMSCollector::verify_after_remark_work_1() {
   MarkRefsIntoClosure notOlder(_span, verification_mark_bm());
   gch->rem_set()->prepare_for_younger_refs_iterate(false); // Not parallel.
 
+  phase_times->note_gc_start(1);
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, 0, os::elapsedTime());
   gch->gen_process_roots(_cmsGen->level(),
                          true,   // younger gens are roots
                          true,   // activate StrongRootsScope
@@ -3080,7 +3082,10 @@ void CMSCollector::verify_after_remark_work_1() {
                          should_unload_classes(),
                          &notOlder,
                          NULL,
-                         NULL);  // SSS: Provide correct closure
+                         NULL,   // SSS: Provide correct closure
+                         phase_times,
+                         0);
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, 0, os::elapsedTime());
 
   // Now mark from the roots
   MarkFromRootsClosure markFromRootsClosure(this, _span,
@@ -3131,6 +3136,7 @@ void CMSCollector::verify_after_remark_work_2() {
   HandleMark  hm;
   GenCollectedHeap* gch = GenCollectedHeap::heap();
 
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
   // Get a clear set of claim bits for the roots processing to work with.
   ClassLoaderDataGraph::clear_claimed_marks();
 
@@ -3141,6 +3147,8 @@ void CMSCollector::verify_after_remark_work_2() {
 
   gch->rem_set()->prepare_for_younger_refs_iterate(false); // Not parallel.
 
+  phase_times->note_gc_start(1);
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, 0, os::elapsedTime());
   gch->gen_process_roots(_cmsGen->level(),
                          true,   // younger gens are roots
                          true,   // activate StrongRootsScope
@@ -3148,8 +3156,10 @@ void CMSCollector::verify_after_remark_work_2() {
                          should_unload_classes(),
                          &notOlder,
                          NULL,
-                         &cld_closure);
-
+                         &cld_closure,
+                         phase_times,
+                         0);
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, 0, os::elapsedTime());
   // Now mark from the roots
   MarkFromRootsVerifyClosure markFromRootsClosure(this, _span,
     verification_mark_bm(), markBitMap(), verification_mark_stack());
@@ -3724,6 +3734,7 @@ void CMSCollector::checkpointRootsInitialWork(bool asynch) {
   // Update the saved marks which may affect the root scans.
   gch->save_marks();
 
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
   // weak reference processing has not started yet.
   ref_processor()->set_enqueuing_is_done(false);
 
@@ -3746,6 +3757,7 @@ void CMSCollector::checkpointRootsInitialWork(bool asynch) {
       FlexibleWorkGang* workers = gch->workers();
       assert(workers != NULL, "Need parallel worker threads.");
       int n_workers = workers->active_workers();
+      phase_times->note_gc_start(n_workers);
       CMSParInitialMarkTask tsk(this, n_workers);
       gch->set_par_threads(n_workers);
       initialize_sequential_subtasks_for_young_gen_rescan(n_workers);
@@ -3761,6 +3773,8 @@ void CMSCollector::checkpointRootsInitialWork(bool asynch) {
       // The serial version.
       CLDToOopClosure cld_closure(&notOlder, true);
       gch->rem_set()->prepare_for_younger_refs_iterate(false); // Not parallel.
+      phase_times->note_gc_start(1);
+      phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, 0, os::elapsedTime());
       gch->gen_process_roots(_cmsGen->level(),
                              true,   // younger gens are roots
                              true,   // activate StrongRootsScope
@@ -3768,7 +3782,14 @@ void CMSCollector::checkpointRootsInitialWork(bool asynch) {
                              should_unload_classes(),
                              &notOlder,
                              NULL,
-                             &cld_closure);
+                             &cld_closure,
+                             phase_times,
+                             0);
+      phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, 0, os::elapsedTime());
+    }
+    phase_times->note_gc_end();
+    if (PrintGCRootsTraceTime && PrintGCDetails) {
+      phase_times->log_gc_details();
     }
   }
 
@@ -5245,6 +5266,8 @@ void CMSParInitialMarkTask::work(uint worker_id) {
   // ---------- scan from roots --------------
   _timer.start();
   GenCollectedHeap* gch = GenCollectedHeap::heap();
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, worker_id, os::elapsedTime());
   Par_MarkRefsIntoClosure par_mri_cl(_collector->_span, &(_collector->_markBitMap));
 
   // ---------- young gen roots --------------
@@ -5271,7 +5294,9 @@ void CMSParInitialMarkTask::work(uint worker_id) {
                          _collector->should_unload_classes(),
                          &par_mri_cl,
                          NULL,
-                         &cld_closure);
+                         &cld_closure,
+                         phase_times,
+                         worker_id);
   assert(_collector->should_unload_classes()
          || (_collector->CMSCollector::roots_scanning_options() & GenCollectedHeap::SO_AllCodeCache),
          "if we didn't scan the code cache, we have to be ready to drop nmethods with expired weak oops");
@@ -5281,6 +5306,7 @@ void CMSParInitialMarkTask::work(uint worker_id) {
       "Finished remaining root initial mark scan work in %dth thread: %3.3f sec",
       worker_id, _timer.seconds());
   }
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, worker_id, os::elapsedTime());
 }
 
 // Parallel remark task
@@ -5377,6 +5403,8 @@ void CMSParRemarkTask::work(uint worker_id) {
   // ---------- rescan from roots --------------
   _timer.start();
   GenCollectedHeap* gch = GenCollectedHeap::heap();
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, worker_id, os::elapsedTime());
   Par_MarkRefsIntoAndScanClosure par_mrias_cl(_collector,
     _collector->_span, _collector->ref_processor(),
     &(_collector->_markBitMap),
@@ -5407,7 +5435,9 @@ void CMSParRemarkTask::work(uint worker_id) {
                          _collector->should_unload_classes(),
                          &par_mrias_cl,
                          NULL,
-                         NULL);     // The dirty klasses will be handled below
+                         NULL,      // The dirty klasses will be handled below
+                         phase_times,
+                         worker_id);
 
   assert(_collector->should_unload_classes()
          || (_collector->CMSCollector::roots_scanning_options() & GenCollectedHeap::SO_AllCodeCache),
@@ -5492,6 +5522,7 @@ void CMSParRemarkTask::work(uint worker_id) {
       "Finished work stealing in %dth thread: %3.3f sec",
       worker_id, _timer.seconds());
   }
+  phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, worker_id, os::elapsedTime());
 }
 
 // Note that parameter "i" is not used.
@@ -5909,6 +5940,8 @@ void CMSCollector::do_remark_parallel() {
   // claimed by the parallel threads.
   cms_space->initialize_sequential_subtasks_for_rescan(n_workers);
 
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
+  phase_times->note_gc_start(n_workers);
   // It turns out that even when we're using 1 thread, doing the work in a
   // separate thread causes wide variance in run times.  We can't help this
   // in the multi-threaded case, but we special-case n=1 here to get
@@ -5926,6 +5959,11 @@ void CMSCollector::do_remark_parallel() {
     tsk.work(0);
   }
 
+  phase_times->note_gc_end();
+  if (PrintGCRootsTraceTime && PrintGCDetails) {
+    phase_times->log_gc_details();
+  }
+
   gch->set_par_threads(0);  // 0 ==> non-parallel.
   // restore, single-threaded for now, any preserved marks
   // as a result of work_q overflow
@@ -5938,7 +5976,7 @@ void CMSCollector::do_remark_non_parallel() {
   HandleMark   hm;
   GenCollectedHeap* gch = GenCollectedHeap::heap();
   ReferenceProcessorMTDiscoveryMutator mt(ref_processor(), false);
-
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
   MarkRefsIntoAndScanClosure
     mrias_cl(_span, ref_processor(), &_markBitMap, NULL /* not precleaning */,
              &_markStack, this,
@@ -5992,6 +6030,8 @@ void CMSCollector::do_remark_non_parallel() {
     gch->rem_set()->prepare_for_younger_refs_iterate(false); // Not parallel.
     GenCollectedHeap::StrongRootsScope srs(gch);
 
+    phase_times->note_gc_start(1);
+    phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerStart, 0, os::elapsedTime());
     gch->gen_process_roots(_cmsGen->level(),
                            true,  // younger gens as roots
                            false, // use the local StrongRootsScope
@@ -5999,7 +6039,10 @@ void CMSCollector::do_remark_non_parallel() {
                            should_unload_classes(),
                            &mrias_cl,
                            NULL,
-                           NULL); // The dirty klasses will be handled below
+                           NULL,  // The dirty klasses will be handled below
+                           phase_times,
+                           0);
+    phase_times->record_time_secs(GenGCPhaseTimes::GCWorkerEnd, 0, os::elapsedTime());
 
     assert(should_unload_classes()
            || (roots_scanning_options() & GenCollectedHeap::SO_AllCodeCache),

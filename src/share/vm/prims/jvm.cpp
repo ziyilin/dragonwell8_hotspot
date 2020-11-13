@@ -35,8 +35,11 @@
 #include "classfile/systemDictionaryShared.hpp"
 #endif
 #include "classfile/vmSymbols.hpp"
+#include "code/codeCache.hpp"
 #include "gc_interface/collectedHeap.inline.hpp"
 #include "interpreter/bytecode.hpp"
+#include "jwarmup/jitWarmUp.hpp"
+#include "jfr/jfrEvents.hpp"
 #include "memory/oopFactory.hpp"
 #include "memory/referenceType.hpp"
 #include "memory/universe.inline.hpp"
@@ -51,6 +54,7 @@
 #include "prims/nativeLookup.hpp"
 #include "prims/privilegedStack.hpp"
 #include "runtime/arguments.hpp"
+#include "runtime/compilationPolicy.hpp"
 #include "runtime/dtraceJSDT.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/init.hpp"
@@ -67,7 +71,6 @@
 #include "services/attachListener.hpp"
 #include "services/management.hpp"
 #include "services/threadService.hpp"
-#include "trace/tracing.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/defaultStream.hpp"
 #include "utilities/dtrace.hpp"
@@ -75,6 +78,8 @@
 #include "utilities/histogram.hpp"
 #include "utilities/top.hpp"
 #include "utilities/utf8.hpp"
+#include "gc_implementation/g1/g1CollectedHeap.hpp"
+#include "gc_implementation/g1/elasticHeap.hpp"
 #ifdef TARGET_OS_FAMILY_linux
 # include "jvm_linux.h"
 #endif
@@ -96,6 +101,7 @@
 #endif // INCLUDE_ALL_GCS
 
 #include <errno.h>
+#include <jfr/recorder/jfrRecorder.hpp>
 
 #ifndef USDT2
 HS_DTRACE_PROBE_DECL1(hotspot, thread__sleep__begin, long long);
@@ -372,6 +378,44 @@ JVM_ENTRY(jobject, JVM_InitProperties(JNIEnv *env, jobject properties))
     }
   }
 
+  //Convert the -XX:+MultiTenant command line flag
+  //to the com.alibaba.tenant.enableMultiTenant property in case that
+  //the java code can determine if the tenant feature is enabled but
+  //without loading tenant-related classes.
+  {
+    if(MultiTenant) {
+      PUTPROP(props, "com.alibaba.tenant.enableMultiTenant", "true");
+    } else {
+      PUTPROP(props, "com.alibaba.tenant.enableMultiTenant", "false");
+    }
+  }
+
+  //Convert the -XX:+EnableCoroutine command line flag
+  //to the com.alibaba.coroutine.enableCoroutine property in case that
+  //the java code can determine if the coroutine feature is enabled.
+  {
+    PUTPROP(props, "com.alibaba.coroutine.enableCoroutine",
+        EnableCoroutine ? "true" : "false");
+  }
+
+  //Convert the -XX:+UseWisp2 command line flag
+  //to the below properties in case that the java code can determine
+  //if the wisp2 feature is enabled:
+  //com.alibaba.wisp.transparentWispSwitch
+  //com.alibaba.wisp.enableThreadAsWisp
+  //com.alibaba.wisp.version
+  //com.alibaba.wisp.allThreadAsWisp
+  //com.alibaba.wisp.enableHandOff
+  {
+    if (UseWisp2) {
+      PUTPROP(props, "com.alibaba.wisp.transparentWispSwitch", "true");
+      if (Arguments::get_property("com.alibaba.wisp.allThreadAsWisp") == NULL) {
+        PUTPROP(props, "com.alibaba.wisp.enableThreadAsWisp", "true");
+        PUTPROP(props, "com.alibaba.wisp.allThreadAsWisp", "true");
+      }
+    }
+  }
+
   // JVM monitoring and management support
   // Add the sun.management.compiler property for the compiler's name
   {
@@ -440,6 +484,16 @@ JVM_ENTRY_NO_ENV(void, JVM_Exit(jint code))
   }
   before_exit(thread);
   vm_exit(code);
+JVM_END
+
+
+JVM_ENTRY_NO_ENV(void, JVM_BeforeHalt())
+  JVMWrapper("JVM_BeforeHalt");
+  EventShutdown event;
+  if (event.should_commit()) {
+    event.set_reason("Shutdown requested from Java");
+    event.commit();
+  }
 JVM_END
 
 
@@ -515,6 +569,17 @@ JVM_ENTRY_NO_ENV(jint, JVM_ActiveProcessorCount(void))
 JVM_END
 
 
+JVM_ENTRY_NO_ENV(jboolean, JVM_IsUseContainerSupport(void))
+  JVMWrapper("JVM_IsUseContainerSupport");
+#ifdef TARGET_OS_FAMILY_linux
+  if (UseContainerSupport) {
+      return JNI_TRUE;
+  }
+#endif
+  return JNI_FALSE;
+JVM_END
+
+
 
 // java.lang.Throwable //////////////////////////////////////////////////////
 
@@ -556,6 +621,12 @@ JVM_ENTRY(void, JVM_MonitorWait(JNIEnv* env, jobject handle, jlong ms))
   JVMWrapper("JVM_MonitorWait");
   Handle obj(THREAD, JNIHandles::resolve_non_null(handle));
   JavaThreadInObjectWaitState jtiows(thread, ms != 0);
+
+  WispPostStealHandleUpdateMark w(thread, THREAD, env, __tiv, __hm, &jtiows);
+
+  // Coroutine work steal support
+  EnableStealMark p(THREAD);
+
   if (JvmtiExport::should_post_monitor_wait()) {
     JvmtiExport::post_monitor_wait((JavaThread *)THREAD, (oop)obj(), ms);
 
@@ -1477,7 +1548,12 @@ JVM_ENTRY(jobject, JVM_DoPrivileged(JNIEnv *env, jclass cls, jobject action, job
   Handle pending_exception;
   JavaValue result(T_OBJECT);
   JavaCallArguments args(object);
-  JavaCalls::call(&result, m, &args, THREAD);
+
+  {
+    WispPostStealHandleUpdateMark w(thread, THREAD, env, __tiv, __hm, NULL, &vfst, &m);
+    EnableStealMark p(THREAD);
+    JavaCalls::call(&result, m, &args, THREAD);
+  }
 
   // done with action, remove ourselves from the list
   if (!vfst.at_end()) {
@@ -3064,12 +3140,37 @@ static void thread_entry(JavaThread* thread, TRAPS) {
   HandleMark hm(THREAD);
   Handle obj(THREAD, thread->threadObj());
   JavaValue result(T_VOID);
-  JavaCalls::call_virtual(&result,
+
+  if(MultiTenant) {
+    oop tenantContainer =
+             java_lang_Thread::inherited_tenant_container(thread->threadObj());
+    if(tenantContainer == NULL) {
+      JavaCalls::call_virtual(&result,
                           obj,
                           KlassHandle(THREAD, SystemDictionary::Thread_klass()),
                           vmSymbols::run_method_name(),
                           vmSymbols::void_method_signature(),
                           THREAD);
+    } else {
+      /*Call into TenantContainer.runThread instead  of Thread.run. */
+      Handle tenant_obj(THREAD, tenantContainer);
+      JavaCalls::call_virtual(&result,
+                          tenant_obj,
+                          KlassHandle(THREAD, SystemDictionary::com_alibaba_tenant_TenantContainer_klass()),
+                          vmSymbols::runThread_method_name(),
+                          vmSymbols::thread_void_signature(),
+                          obj,
+                          THREAD);
+
+    }
+  } else {
+    JavaCalls::call_virtual(&result,
+                          obj,
+                          KlassHandle(THREAD, SystemDictionary::Thread_klass()),
+                          vmSymbols::run_method_name(),
+                          vmSymbols::void_method_signature(),
+                          THREAD);
+  }
 }
 
 
@@ -3140,6 +3241,15 @@ JVM_ENTRY(void, JVM_StartThread(JNIEnv* env, jobject jthread))
     THROW_MSG(vmSymbols::java_lang_OutOfMemoryError(),
               "unable to create new native thread");
   }
+
+#if INCLUDE_JFR
+  if (JfrRecorder::is_recording() && EventThreadStart::is_enabled() &&
+      EventThreadStart::is_stacktrace_enabled()) {
+    JfrThreadLocal* tl = native_thread->jfr_thread_local();
+    // skip Thread.start() and Thread.start0()
+    tl->set_cached_stack_trace_id(JfrStackTraceRepository::record(thread, 2, WALK_BY_DEFAULT));
+  }
+#endif
 
   Thread::start(native_thread);
 
@@ -3276,6 +3386,12 @@ JVM_ENTRY(void, JVM_Yield(JNIEnv *env, jclass threadClass))
   }
 JVM_END
 
+static void post_thread_sleep_event(EventThreadSleep* event, jlong millis) {
+  assert(event != NULL, "invariant");
+  assert(event->should_commit(), "invariant");
+  event->set_time(millis);
+  event->commit();
+}
 
 JVM_ENTRY(void, JVM_Sleep(JNIEnv* env, jclass threadClass, jlong millis))
   JVMWrapper("JVM_Sleep");
@@ -3322,8 +3438,7 @@ JVM_ENTRY(void, JVM_Sleep(JNIEnv* env, jclass threadClass, jlong millis))
       // us while we were sleeping. We do not overwrite those.
       if (!HAS_PENDING_EXCEPTION) {
         if (event.should_commit()) {
-          event.set_time(millis);
-          event.commit();
+          post_thread_sleep_event(&event, millis);
         }
 #ifndef USDT2
         HS_DTRACE_PROBE1(hotspot, thread__sleep__end,1);
@@ -3339,8 +3454,7 @@ JVM_ENTRY(void, JVM_Sleep(JNIEnv* env, jclass threadClass, jlong millis))
     thread->osthread()->set_state(old_state);
   }
   if (event.should_commit()) {
-    event.set_time(millis);
-    event.commit();
+    post_thread_sleep_event(&event, millis);
   }
 #ifndef USDT2
   HS_DTRACE_PROBE1(hotspot, thread__sleep__end,0);
@@ -3441,6 +3555,41 @@ JVM_QUICK_ENTRY(jboolean, JVM_IsInterrupted(JNIEnv* env, jobject jthread, jboole
     return (jboolean) Thread::is_interrupted(thr, clear_interrupted != 0);
   }
 JVM_END
+
+JVM_QUICK_ENTRY(jboolean, JVM_IsInSameNative(JNIEnv* env, jobject jthread))
+  JVMWrapper("JVM_IsInSameNative");
+  assert(EnableCoroutine, "coroutine not enabled");
+  oop java_thread = JNIHandles::resolve_non_null(jthread);
+  MutexLockerEx ml(thread->threadObj() == java_thread ? NULL : Threads_lock);
+  // We need to re-resolve the java_thread, since a GC might have happened during the
+  // acquire of the lock
+  JavaThread* thr = java_lang_Thread::thread(JNIHandles::resolve_non_null(jthread));
+  // the thread is in native status and the native call counter isn't changed during two calls
+  // then return true
+  if (thr != NULL && thr->thread_state() == _thread_in_native) {
+    Coroutine* coro = thr->coroutine_list();
+    assert(coro != NULL, "coroutine list");
+    if (coro->last_native_call_counter() == coro->native_call_counter()) {
+      return JNI_TRUE;
+    } else {
+      coro->set_last_native_call_counter(coro->native_call_counter());
+    }
+  }
+  return JNI_FALSE;
+JVM_END
+
+JVM_ENTRY(jboolean, JVM_CheckAndClearNativeInterruptForWisp(JNIEnv* env, jobject task, jobject jthread))
+  JVMWrapper("JVM_CheckAndClearNativeInterruptForWisp");
+  // here, maybe the thread is in `Thread.start()`, the eetop is not settled, so we should also block the
+  // condition with `th` is null.
+  JavaThread *th = java_lang_Thread::thread(JNIHandles::resolve_non_null(jthread));
+  if (th != NULL) {
+    return (jboolean)clear_interrupt_for_wisp(th);
+  } else {
+    return (jboolean)false;
+  }
+JVM_END
+
 
 
 // Return true iff the current thread has locked the object passed in
@@ -3832,6 +3981,60 @@ JVM_ENTRY(jclass, JVM_LoadClass0(JNIEnv *env, jobject receiver,
   return result;
 JVM_END
 
+/***************** Tenant support ************************************/
+
+JVM_ENTRY(jobject, JVM_TenantContainerOf(JNIEnv* env, jclass tenantContainerClass, jobject obj))
+  JVMWrapper("JVM_TenantContainerOf");
+  assert(MultiTenant && TenantHeapIsolation, "pre-condition");
+  if (NULL != obj) {
+    oop container = G1CollectedHeap::heap()->tenant_container_of(JNIHandles::resolve_non_null(obj));
+    if (container != NULL) {
+      return JNIHandles::make_local(env, container);
+    }
+  }
+  return NULL;
+JVM_END
+
+JVM_ENTRY(void, JVM_AttachToTenant(JNIEnv *env, jobject ignored, jobject tenant))
+  JVMWrapper("JVM_AttachToTenant");
+  assert(MultiTenant, "pre-condition");
+  assert (NULL != thread, "no current thread!");
+  thread->set_tenantObj(tenant == NULL ? (oop)NULL : JNIHandles::resolve_non_null(tenant));
+JVM_END
+
+JVM_ENTRY(void, JVM_CreateTenantAllocationContext(JNIEnv *env, jobject ignored, jobject tenant, jlong heapLimit))
+  JVMWrapper("JVM_CreateTenantAllocationContext");
+  guarantee(UseG1GC && TenantHeapIsolation, "pre-condition");
+  oop tenant_obj = JNIHandles::resolve_non_null(tenant);
+  assert(tenant_obj != NULL, "Cannot create allocation context for a null tenant container");
+  G1CollectedHeap::heap()->create_tenant_allocation_context(tenant_obj);
+
+  // set up heap limit if TenantHeapThrottling enabled
+  if (TenantHeapThrottling) {
+    assert(heapLimit > 0, "Bad heap limit");
+    G1TenantAllocationContext* context = com_alibaba_tenant_TenantContainer::get_tenant_allocation_context(tenant_obj);
+    assert(context != NULL && context->heap_size_limit() == TENANT_HEAP_NO_LIMIT, "sanity");
+    context->set_heap_size_limit((size_t)heapLimit);
+  }
+JVM_END
+
+// This method should be called before reclaiming of Java TenantContainer object
+JVM_ENTRY(void, JVM_DestroyTenantAllocationContext(JNIEnv *env, jobject ignored, jlong context))
+  JVMWrapper("JVM_DestroyTenantAllocationContext");
+  assert(UseG1GC && TenantHeapIsolation, "pre-condition");
+  oop tenant_obj = ((G1TenantAllocationContext*)context)->tenant_container();
+  assert(tenant_obj != NULL, "Cannot destroy allocation context from a null tenant container");
+  G1CollectedHeap::heap()->destroy_tenant_allocation_context(context);
+JVM_END
+
+JVM_ENTRY(jlong, JVM_GetTenantOccupiedMemory(JNIEnv* env, jobject ignored, jlong context))
+  JVMWrapper("JVM_GetTenantOccupiedMemory");
+  assert(UseG1GC && TenantHeapIsolation, "pre-condition");
+  G1TenantAllocationContext* alloc_context = (G1TenantAllocationContext*)context;
+  assert(alloc_context != NULL, "Bad allocation context!");
+  assert(alloc_context->tenant_container() != NULL, "NULL tenant container");
+  return (alloc_context->occupied_heap_region_count() * HeapRegion::GrainBytes);
+JVM_END
 
 // Array ///////////////////////////////////////////////////////////////////////////////////////////
 
@@ -4275,6 +4478,10 @@ JVM_END
 
 JVM_ENTRY(jobject, JVM_InvokeMethod(JNIEnv *env, jobject method, jobject obj, jobjectArray args0))
   JVMWrapper("JVM_InvokeMethod");
+
+  // Coroutine work steal support
+  WispPostStealHandleUpdateMark w(thread, THREAD, env, __tiv, __hm);
+
   Handle method_handle;
   if (thread->stack_available((address) &method_handle) >= JVMInvokeMethodSlack) {
     method_handle = Handle(THREAD, JNIHandles::resolve(method));
@@ -4300,6 +4507,10 @@ JVM_END
 
 JVM_ENTRY(jobject, JVM_NewInstanceFromConstructor(JNIEnv *env, jobject c, jobjectArray args0))
   JVMWrapper("JVM_NewInstanceFromConstructor");
+
+  // Coroutine work steal support
+  WispPostStealHandleUpdateMark w(thread, THREAD, env, __tiv, __hm);
+
   oop constructor_mirror = JNIHandles::resolve(c);
   objArrayHandle args(THREAD, objArrayOop(JNIHandles::resolve(args0)));
   oop result = Reflection::invoke_constructor(constructor_mirror, args, CHECK_NULL);
@@ -4681,4 +4892,187 @@ JVM_ENTRY(void, JVM_GetVersionInfo(JNIEnv* env, jvm_version_info* info, size_t i
   // counter defined in runtimeService.cpp.
   info->is_attachable = AttachListener::is_attach_supported();
 }
+JVM_END
+
+JVM_ENTRY(void, JVM_NotifyApplicationStartUpIsDone(JNIEnv* env, jclass clz))
+{
+  JVMWrapper("JVM_NotifyApplicationStartUpIsDone");
+  if (!CompilationWarmUp) {
+    tty->print_cr("CompilationWarmUp is off, "
+                  "notifyApplicationStartUpIsDone is invalid");
+    return;
+  }
+  Handle mirror(THREAD, JNIHandles::resolve_non_null(clz));
+  assert(mirror() != NULL, "sanity check");
+  Klass* k = java_lang_Class::as_Klass(mirror());
+  Method* dummy_method = k->lookup_method(vmSymbols::jwarmup_dummy_name(), vmSymbols::void_method_signature());
+  assert(dummy_method != NULL, "Cannot find dummy method in com.alibaba.jwarmup.JWarmUp");
+  JitWarmUp* jwp = JitWarmUp::instance();
+  assert(jwp != NULL, "sanity check");
+  jwp->set_dummy_method(dummy_method);
+  jwp->preloader()->notify_application_startup_is_done();
+}
+JVM_END
+
+JVM_ENTRY(jboolean, JVM_CheckJWarmUpCompilationIsComplete(JNIEnv *env, jclass ignored))
+{
+  JVMWrapper("JVM_CheckJWarmUpCompilationIsComplete");
+  if (!CompilationWarmUp) {
+    tty->print_cr("CompilationWarmUp is off, "
+                  "checkIfCompilationIsComplete is invalid");
+    return JNI_TRUE;
+  }
+  JitWarmUp* jwp = JitWarmUp::instance();
+  Method* dm = jwp->dummy_method();
+  assert(dm != NULL, "sanity check");
+  if (dm->code() != NULL) {
+    return JNI_TRUE;
+  } else {
+    return JNI_FALSE;
+  }
+}
+JVM_END
+
+JVM_ENTRY(void, JVM_NotifyJVMDeoptWarmUpMethods(JNIEnv *env, jclass clazz))
+{
+  JVMWrapper("JVM_NotifyJVMDeoptWarmUpMethods");
+  if (!(CompilationWarmUp && CompilationWarmUpExplicitDeopt)) {
+    tty->print_cr("CompilationWarmUp or CompilationWarmUpExplicitDeopt is off, "
+                  "notifyJVMDeoptWarmUpMethods is invalid");
+    return;
+  }
+  JitWarmUp* jwp = JitWarmUp::instance();
+  Method* dm = jwp->dummy_method();
+  if (dm != NULL && dm->code() != NULL) {
+    PreloadClassChain* chain = jwp->preloader()->chain();
+    assert(chain != NULL, "sanity check");
+    if (chain->notify_deopt_signal()) {
+      tty->print_cr("JitWarmUp: receive signal to deoptimize warmup methods");
+    } else {
+      tty->print_cr("JitWarmUp: deoptimize signal is ignore");
+    }
+  } else {
+    tty->print_cr("JitWarmUp: deoptimize signal is ignore because warmup is not finished");
+  }
+}
+JVM_END
+
+JVM_ENTRY(jint, JVM_ElasticHeapGetEvaluationMode(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetEvaluationMode");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->evaluation_mode();
+JVM_END
+
+JVM_ENTRY(void, JVM_ElasticHeapSetYoungGenCommitPercent(JNIEnv *env, jclass klass, jint percent))
+  JVMWrapper("JVM_ElasticHeapSetYoungGenCommitPercent");
+  assert(G1ElasticHeap, "Precondition");
+
+  ElasticHeap* elas = G1CollectedHeap::heap()->elastic_heap();
+  ElasticHeap::ErrorType error = elas->configure_setting(percent, ElasticHeap::ignore_arg(),
+                                                           ElasticHeap::ignore_arg());
+
+  if (error == ElasticHeap::IllegalYoungPercent) {
+    char as_chars[256];
+    jio_snprintf(as_chars, sizeof(as_chars), "percent should be 0, or between %u and 100 ", ElasticHeapMinYoungCommitPercent);
+    THROW_MSG(vmSymbols::java_lang_IllegalArgumentException(), as_chars);
+  } else if (error != ElasticHeap::NoError) {
+    THROW_MSG(vmSymbols::java_lang_IllegalStateException(), ElasticHeap::to_string(error));
+  }
+JVM_END
+
+JVM_ENTRY(jint, JVM_ElasticHeapGetYoungGenCommitPercent(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetYoungGenCommitPercent");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->young_commit_percent();
+JVM_END
+
+JVM_ENTRY(void, JVM_ElasticHeapSetUncommitIHOP(JNIEnv *env, jclass klass, jint percent))
+  JVMWrapper("JVM_ElasticHeapSetUncommitIHOP");
+  assert(G1ElasticHeap, "Precondition");
+  assert(percent >= 0 && percent <= 100, "sanity");
+
+  ElasticHeap* elas = G1CollectedHeap::heap()->elastic_heap();
+  ElasticHeap::ErrorType error = elas->configure_setting(ElasticHeap::ignore_arg(), percent,
+                                                           ElasticHeap::ignore_arg());
+  if (error != ElasticHeap::NoError) {
+    THROW_MSG(vmSymbols::java_lang_IllegalStateException(), ElasticHeap::to_string(error));
+  }
+JVM_END
+
+JVM_ENTRY(jint, JVM_ElasticHeapGetUncommitIHOP(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetUncommitIHOP");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->uncommit_ihop();
+JVM_END
+
+JVM_ENTRY(jlong, JVM_ElasticHeapGetTotalYoungUncommittedBytes(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetTotalYoungUncommittedBytes");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->young_uncommitted_bytes();
+JVM_END
+
+JVM_ENTRY(void, JVM_ElasticHeapSetSoftmxPercent(JNIEnv *env, jclass klass, jint percent))
+  JVMWrapper("JVM_ElasticHeapSetSoftmxPercent");
+  assert(G1ElasticHeap, "Precondition");
+  assert(percent >= 0 && percent <= 100, "sanity");
+
+  ElasticHeap* elas = G1CollectedHeap::heap()->elastic_heap();
+
+  ElasticHeap::ErrorType error = elas->configure_setting(ElasticHeap::ignore_arg(),
+                                                           ElasticHeap::ignore_arg(), percent);
+  if (error != ElasticHeap::NoError) {
+    THROW_MSG(vmSymbols::java_lang_IllegalStateException(), ElasticHeap::to_string(error));
+  }
+JVM_END
+
+JVM_ENTRY(jint, JVM_ElasticHeapGetSoftmxPercent(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetSoftmxPercent");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->softmx_percent();
+JVM_END
+
+JVM_ENTRY(jlong, JVM_ElasticHeapGetTotalUncommittedBytes(JNIEnv *env, jclass klass))
+  JVMWrapper("JVM_ElasticHeapGetTotalUncommittedBytes");
+  assert(G1ElasticHeap, "Precondition");
+
+  return G1CollectedHeap::heap()->elastic_heap()->uncommitted_bytes();
+JVM_END
+
+JVM_ENTRY(void, JVM_SetWispTask(JNIEnv* env, jclass klass, jlong coroutinePtr, jint task_id, jobject task, jobject engine))
+  JVMWrapper("JVM_SetWispTask");
+  Coroutine* coro = (Coroutine*)coroutinePtr;
+  coro->set_wisp_task_id(task_id);
+  coro->set_wisp_engine(JNIHandles::resolve_non_null(engine));
+  coro->set_wisp_task(JNIHandles::resolve_non_null(task));
+JVM_END
+
+JVM_ENTRY(jint, JVM_GetProxyUnpark(JNIEnv* env, jclass klass, jintArray res))
+  JVMWrapper("JVM_GetProxyUnpark");
+  return WispThread::get_proxy_unpark(res);
+JVM_END
+
+JVM_ENTRY(void, JVM_MarkPreempted(JNIEnv* env, jclass klass, jobject threadObj, jboolean force))
+  JVMWrapper("JVM_MarkPreempted");
+  JavaThread* thr = NULL;
+  {
+    //Use lock to prevent deleting thr when we do the update on it.
+    MutexLockerEx mu(Threads_lock);
+    thr = java_lang_Thread::thread(JNIHandles::resolve_non_null(threadObj));
+
+    if (thr == NULL || thr->is_terminated() ||
+        thr->wisp_preempted()) { // already mark preempted, do not fire safepoint again
+      return;
+    }
+    thr->set_wisp_preempted(true);
+  }
+  // fire an empty safepoint to let the thread go check flag
+  if (force) {
+    VM_ForceSafepoint force_safepoint_op;
+    VMThread::execute(&force_safepoint_op);
+  }
 JVM_END

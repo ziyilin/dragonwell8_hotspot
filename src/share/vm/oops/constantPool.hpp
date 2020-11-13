@@ -32,6 +32,7 @@
 #include "oops/typeArrayOop.hpp"
 #include "runtime/handles.hpp"
 #include "utilities/constantTag.hpp"
+#include "utilities/stack.hpp"
 #ifdef TARGET_ARCH_x86
 # include "bytes_x86.hpp"
 #endif
@@ -100,6 +101,13 @@ class ConstantPool : public Metadata {
   Array<u2>*           _reference_map;
 
   enum {
+    _jwp_has_not_been_traversed = 0,
+    _jwp_has_been_traversed = 1
+  };
+
+  Array<u1>*           _jwp_tags;    // the jwp tag array records the corresponding tag whether is traversed
+
+  enum {
     _has_preresolution = 1,           // Flags
     _on_stack          = 2
   };
@@ -117,6 +125,7 @@ class ConstantPool : public Metadata {
   Monitor*             _lock;
 
   void set_tags(Array<u1>* tags)               { _tags = tags; }
+  void set_jwp_tags(Array<u1>* tags)           { _jwp_tags = tags; }
   void tag_at_put(int which, jbyte t)          { tags()->at_put(which, t); }
   void release_tag_at_put(int which, jbyte t)  { tags()->release_at_put(which, t); }
 
@@ -128,7 +137,7 @@ class ConstantPool : public Metadata {
  private:
   intptr_t* base() const { return (intptr_t*) (((char*) this) + sizeof(ConstantPool)); }
 
-  CPSlot slot_at(int which) {
+  CPSlot slot_at(int which) const {
     assert(is_within_bounds(which), "index out of bounds");
     // Uses volatile because the klass slot changes without a lock.
     volatile intptr_t adr = (intptr_t)OrderAccess::load_ptr_acquire(obj_at_addr_raw(which));
@@ -167,6 +176,8 @@ class ConstantPool : public Metadata {
   }
 
   ConstantPool(Array<u1>* tags);
+  // for JWarmUP
+  ConstantPool(Array<u1>* tags, Array<u1>* jwp_tags);
   ConstantPool() { assert(DumpSharedSpaces || UseSharedSpaces, "only for CDS"); }
  public:
   static ConstantPool* allocate(ClassLoaderData* loader_data, int length, TRAPS);
@@ -175,6 +186,18 @@ class ConstantPool : public Metadata {
 
   Array<u1>* tags() const                   { return _tags; }
   Array<u2>* operands() const               { return _operands; }
+
+  Array<u1>* jwp_tags() const               { return _jwp_tags; }
+
+  bool jwarmup_traversed_at(int which) {
+    assert(0 < which && which < jwp_tags()->length(), "out of bound");
+    return jwp_tags()->at(which) == _jwp_has_been_traversed;
+  }
+
+  void jwarmup_has_traversed_at(int which) {
+    assert(which < jwp_tags()->length(), "out of bound");
+    jwp_tags()->at_put(which, _jwp_has_been_traversed);
+  }
 
   bool has_preresolution() const            { return (_flags & _has_preresolution) != 0; }
   void set_has_preresolution()              { _flags |= _has_preresolution; }
@@ -356,7 +379,7 @@ class ConstantPool : public Metadata {
     return klass_at_impl(h_this, which, CHECK_NULL);
   }
 
-  Symbol* klass_name_at(int which);  // Returns the name, w/o resolving.
+  Symbol* klass_name_at(int which) const;  // Returns the name, w/o resolving.
 
   Klass* resolved_klass_at(int which) const {  // Used by Compiler
     guarantee(tag_at(which).is_klass(), "Corrupted constant pool");
@@ -826,8 +849,12 @@ class ConstantPool : public Metadata {
   static void resolve_string_constants_impl(constantPoolHandle this_oop, TRAPS);
 
   static oop resolve_constant_at_impl(constantPoolHandle this_oop, int index, int cache_index, TRAPS);
-  static void save_and_throw_exception(constantPoolHandle this_oop, int which, int tag_value, TRAPS);
   static oop resolve_bootstrap_specifier_at_impl(constantPoolHandle this_oop, int index, TRAPS);
+
+  // Exception handling
+  static void throw_resolution_error(constantPoolHandle this_oop, int which, TRAPS);
+  static Symbol* exception_message(constantPoolHandle this_oop, int which, constantTag tag, oop pending_exception);
+  static void save_and_throw_exception(constantPoolHandle this_oop, int which, constantTag tag, TRAPS);
 
  public:
   // Merging ConstantPool* support:
@@ -890,6 +917,13 @@ class ConstantPool : public Metadata {
   // Compile the world support
   static void preload_and_initialize_all_classes(ConstantPool* constant_pool, TRAPS);
 #endif
+
+  void preload_jwarmup_classes(TRAPS);
+
+  Klass* resolve_class_from_slot(int which, TRAPS);
+
+ private:
+  void preload_jwarmup_classes_impl(Stack<InstanceKlass*, mtClass>& s, TRAPS);
 };
 
 class SymbolHashMapEntry : public CHeapObj<mtSymbol> {

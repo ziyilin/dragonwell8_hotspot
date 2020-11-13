@@ -40,6 +40,8 @@ const char* NMTUtil::_memory_type_names[] = {
   "Arena Chunk",
   "Test",
   "Tracing",
+  "Tenant",
+  "Wisp",
   "Unknown"
 };
 

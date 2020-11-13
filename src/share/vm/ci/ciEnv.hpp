@@ -72,6 +72,7 @@ private:
   bool  _jvmti_can_hotswap_or_post_breakpoint;
   bool  _jvmti_can_access_local_variables;
   bool  _jvmti_can_post_on_exceptions;
+  bool  _jvmti_can_pop_frame;
 
   // Cache DTrace flags
   bool  _dtrace_extended_probes;
@@ -129,6 +130,8 @@ private:
                                    ciInstanceKlass* accessor);
   ciField*   get_field_by_index(ciInstanceKlass* loading_klass,
                                 int field_index);
+  bool       check_field_resolved(ciInstanceKlass* accessor,
+                                  int index);
   ciMethod*  get_method_by_index(constantPoolHandle cpool,
                                  int method_index, Bytecodes::Code bc,
                                  ciInstanceKlass* loading_klass);
@@ -320,6 +323,9 @@ public:
   // Return state of appropriate compilability
   int compilable() { return _compilable; }
 
+  // Check if all fields needed by this method in ConstantPool are resolved
+  bool       check_method_fields_all_resolved(ciMethod* method);
+
   const char* retry_message() const {
     switch (_compilable) {
       case ciEnv::MethodCompilable_not_at_tier:
@@ -339,8 +345,9 @@ public:
 
   // Cache Jvmti state
   void  cache_jvmti_state();
+  bool  jvmti_state_changed() const;
+  bool  should_retain_local_variables() const;
   bool  jvmti_can_hotswap_or_post_breakpoint() const { return _jvmti_can_hotswap_or_post_breakpoint; }
-  bool  jvmti_can_access_local_variables()     const { return _jvmti_can_access_local_variables; }
   bool  jvmti_can_post_on_exceptions()         const { return _jvmti_can_post_on_exceptions; }
 
   // Cache DTrace flags

@@ -72,7 +72,8 @@ static uintx chunk_oops_do(OopClosure* f, Chunk* chunk, char* chunk_top) {
   while (bottom < top) {
     // This test can be moved up but for now check every oop.
 
-    assert((*bottom)->is_oop(), "handle should point to oop");
+    // JFR is known to set mark word to 0 for duration of leak analysis VM operaiton
+    assert((*bottom)->is_oop(INCLUDE_JFR), "handle should point to oop");
 
     f->do_oop(bottom++);
   }
@@ -121,6 +122,23 @@ void HandleMark::initialize(Thread* thread) {
   // Link this in the thread
   set_previous_handle_mark(thread->last_handle_mark());
   thread->set_last_handle_mark(this);
+}
+
+HandleMark::HandleMark(Thread* thread, HandleArea* area, HandleMark* last_handle_mark) {
+  _thread = thread;
+  // Save area
+  _area  = area;
+  // Save current top
+  _chunk = _area->_chunk;
+  _hwm   = _area->_hwm;
+  _max   = _area->_max;
+  NOT_PRODUCT(_size_in_bytes = _area->_size_in_bytes;)
+  debug_only(_area->_handle_mark_nesting++);
+  assert(_area->_handle_mark_nesting > 0, "must stack allocate HandleMarks");
+  debug_only(Atomic::inc(&_nof_handlemarks);)
+
+  // Link this in the thread
+  set_previous_handle_mark(last_handle_mark);
 }
 
 

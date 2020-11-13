@@ -35,15 +35,18 @@
 #include "gc_implementation/g1/g1InCSetState.hpp"
 #include "gc_implementation/g1/g1MonitoringSupport.hpp"
 #include "gc_implementation/g1/g1SATBCardTableModRefBS.hpp"
+#include "gc_implementation/g1/g1TenantAllocationContext.hpp"
 #include "gc_implementation/g1/g1YCTypes.hpp"
 #include "gc_implementation/g1/heapRegionManager.hpp"
 #include "gc_implementation/g1/heapRegionSet.hpp"
+#include "gc_implementation/shared/gcHeapSummary.hpp"
 #include "gc_implementation/shared/hSpaceCounters.hpp"
 #include "gc_implementation/shared/parGCAllocBuffer.hpp"
 #include "memory/barrierSet.hpp"
 #include "memory/memRegion.hpp"
 #include "memory/sharedHeap.hpp"
 #include "utilities/stack.hpp"
+#include "gc_implementation/g1/elasticHeap.hpp"
 
 // A "G1CollectedHeap" is an implementation of a java heap for HotSpot.
 // It uses the "Garbage First" heap organization and algorithm, which
@@ -75,7 +78,7 @@ class G1NewTracer;
 class G1OldTracer;
 class EvacuationFailedInfo;
 class nmethod;
-class Ticks;
+class ElasticHeap;
 
 typedef OverflowTaskQueue<StarTask, mtGC>         RefToScanQueue;
 typedef GenericTaskQueueSet<RefToScanQueue, mtGC> RefToScanQueueSet;
@@ -185,6 +188,8 @@ class G1CollectedHeap : public SharedHeap {
   friend class MutatorAllocRegion;
   friend class SurvivorGCAllocRegion;
   friend class OldGCAllocRegion;
+  friend class ElasticHeap;
+  friend class ElasticHeapEvaluator;
   friend class G1Allocator;
   friend class G1DefaultAllocator;
   friend class G1ResManAllocator;
@@ -376,6 +381,8 @@ private:
                                                          size_t size,
                                                          size_t translation_factor);
 
+  void trace_heap(GCWhen::Type when, GCTracer* tracer);
+
   double verify(bool guard, const char* msg);
   void verify_before_gc();
   void verify_after_gc();
@@ -447,6 +454,8 @@ protected:
 
   // The young region list.
   YoungList*  _young_list;
+
+  ElasticHeap* _elastic_heap;
 
   // The current policy object for the collector.
   G1CollectorPolicy* _g1_policy;
@@ -1101,7 +1110,13 @@ public:
   }
 
   // The current number of regions in the heap.
-  uint num_regions() const { return _hrm.length(); }
+  uint num_regions() const {
+    if (G1ElasticHeap && elastic_heap() != NULL && !elastic_heap()->heap_capacity_changed()) {
+      return _hrm.max_length();
+    } else {
+      return _hrm.length();
+    }
+  }
 
   // The max number of regions in the heap.
   uint max_regions() const { return _hrm.max_length(); }
@@ -1482,6 +1497,8 @@ public:
 
   YoungList* young_list() const { return _young_list; }
 
+  ElasticHeap* elastic_heap() const { return _elastic_heap; }
+
   // debugging
   bool check_young_list_well_formed() {
     return _young_list->check_list_well_formed();
@@ -1622,6 +1639,8 @@ public:
   bool is_obj_dead_cond(const oop obj,
                         const VerifyOption vo) const;
 
+  G1HeapSummary create_g1_heap_summary();
+
   // Printing
 
   virtual void print_on(outputStream* st) const;
@@ -1638,12 +1657,42 @@ public:
   void print_cset_rsets() PRODUCT_RETURN;
   void print_all_rsets() PRODUCT_RETURN;
 
+  // Tenant allocation context manipulation
+  void create_tenant_allocation_context(oop tenant_obj);
+  void destroy_tenant_allocation_context(jlong context);
+  oop tenant_container_of(oop obj);
+
 public:
   size_t pending_card_num();
   size_t cards_scanned();
 
 protected:
   size_t _max_heap_capacity;
+
+private:
+  // Context for on-going GC cause
+  AllocationContext_t _gc_cause_context;
+public:
+  void set_gc_cause_context(AllocationContext_t context)  { _gc_cause_context = context;    }
+  AllocationContext_t gc_cause_context()                  { return _gc_cause_context;       }
+};
+
+//
+class G1ContextCauseSetter : public StackObj {
+private:
+  G1CollectedHeap* _g1h;
+public:
+  G1ContextCauseSetter(G1CollectedHeap* g1h, AllocationContext_t context)
+    : _g1h(g1h) {
+    if (TenantHeapIsolation) {
+      G1CollectedHeap::heap()->set_gc_cause_context(context);
+    }
+  }
+  ~G1ContextCauseSetter() {
+    if (TenantHeapIsolation) {
+      G1CollectedHeap::heap()->set_gc_cause_context(AllocationContext::system());
+    }
+  }
 };
 
 #endif // SHARE_VM_GC_IMPLEMENTATION_G1_G1COLLECTEDHEAP_HPP

@@ -159,6 +159,9 @@ JNIEXPORT void JNICALL
 JVM_Exit(jint code);
 
 JNIEXPORT void JNICALL
+JVM_BeforeHalt();
+
+JNIEXPORT void JNICALL
 JVM_Halt(jint code);
 
 JNIEXPORT void JNICALL
@@ -198,6 +201,9 @@ JVM_MaxMemory(void);
 
 JNIEXPORT jint JNICALL
 JVM_ActiveProcessorCount(void);
+
+JNIEXPORT jboolean JNICALL
+JVM_IsUseContainerSupport(void);
 
 JNIEXPORT void * JNICALL
 JVM_LoadLibrary(const char *name);
@@ -293,6 +299,9 @@ JNIEXPORT jboolean JNICALL
 JVM_IsInterrupted(JNIEnv *env, jobject thread, jboolean clearInterrupted);
 
 JNIEXPORT jboolean JNICALL
+JVM_CheckAndClearNativeInterruptForWisp(JNIEnv* env, jobject task, jobject thread);
+
+JNIEXPORT jboolean JNICALL
 JVM_HoldsLock(JNIEnv *env, jclass threadClass, jobject obj);
 
 JNIEXPORT void JNICALL
@@ -303,6 +312,9 @@ JVM_GetAllThreads(JNIEnv *env, jclass dummy);
 
 JNIEXPORT void JNICALL
 JVM_SetNativeThreadName(JNIEnv *env, jobject jthread, jstring name);
+
+JNIEXPORT jboolean JNICALL
+JVM_IsInSameNative(JNIEnv *env, jobject jthread);
 
 /* getStackTrace() and getAllStackTraces() method */
 JNIEXPORT jobjectArray JNICALL
@@ -356,6 +368,24 @@ JVM_LatestUserDefinedLoader(JNIEnv *env);
 JNIEXPORT jclass JNICALL
 JVM_LoadClass0(JNIEnv *env, jobject obj, jclass currClass,
                jstring currClassName);
+
+/*
+ * com.alibaba.tenant.TenantContainer
+ */
+JNIEXPORT void JNICALL
+JVM_AttachToTenant(JNIEnv *env, jobject ignored, jobject tenant);
+
+JNIEXPORT void JNICALL
+JVM_CreateTenantAllocationContext(JNIEnv *env, jobject ignored, jobject tenant, jlong heapLimit);
+
+JNIEXPORT void JNICALL
+JVM_DestroyTenantAllocationContext(JNIEnv *env, jobject ignored, jlong context);
+
+JNIEXPORT jobject JNICALL
+JVM_TenantContainerOf(JNIEnv *env, jclass tenantContainerClass, jobject obj);
+
+JNIEXPORT jlong JNICALL
+JVM_GetTenantOccupiedMemory(JNIEnv *env, jobject ignored, jlong context);
 
 /*
  * java.lang.reflect.Array
@@ -1625,9 +1655,9 @@ typedef struct {
 } jvm_version_info;
 
 #define JVM_VERSION_MAJOR(version) ((version & 0xFF000000) >> 24)
-#define JVM_VERSION_MINOR(version) ((version & 0x00FF0000) >> 16)
+#define JVM_VERSION_MINOR(version) ((version & 0x00FFFF00) >> 8)
 // Micro version is 0 in HotSpot Express VM (set in jvm.cpp).
-#define JVM_VERSION_MICRO(version) ((version & 0x0000FF00) >> 8)
+#define JVM_VERSION_MICRO(version) 0
 /* Build number is available in all HotSpot Express VM builds.
  * It is defined in make/hotspot_version file.
  */
@@ -1640,9 +1670,9 @@ typedef struct {
     // Naming convention of RE build version string: n.n.n[_uu[c]][-<identifier>]-bxx
     unsigned int jdk_version;   /* Consists of major, minor, micro (n.n.n) */
                                 /* and build number (xx) */
-    unsigned int update_version : 8;         /* Update release version (uu) */
+    unsigned int update_version : 16;        /* Update release version (uu) */
     unsigned int special_update_version : 8; /* Special update release version (c)*/
-    unsigned int reserved1 : 16;
+    unsigned int reserved1 : 8;
     unsigned int reserved2;
 
     /* The following bits represents new JDK supports that VM has dependency on.
@@ -1704,6 +1734,46 @@ typedef struct JDK1_1InitArgs {
     jboolean debugging;
     jint debugPort;
 } JDK1_1InitArgs;
+
+JNIEXPORT void JNICALL
+JVM_NotifyApplicationStartUpIsDone(JNIEnv* env, jclass clz);
+
+JNIEXPORT jboolean JNICALL
+JVM_CheckJWarmUpCompilationIsComplete(JNIEnv* env, jclass ignored);
+
+JNIEXPORT void JNICALL
+JVM_NotifyJVMDeoptWarmUpMethods(JNIEnv* env, jclass clz);
+
+/*
+ * com.alibaba.management.ElasticHeapMXBeanImpl
+ */
+JNIEXPORT jint JNICALL
+JVM_ElasticHeapGetEvaluationMode(JNIEnv *env, jclass clazz);
+JNIEXPORT void JNICALL
+JVM_ElasticHeapSetYoungGenCommitPercent(JNIEnv *env, jclass klass, jint percent);
+JNIEXPORT jint JNICALL
+JVM_ElasticHeapGetYoungGenCommitPercent(JNIEnv *env, jclass klass);
+JNIEXPORT void JNICALL
+JVM_ElasticHeapSetUncommitIHOP(JNIEnv *env, jclass clazz, jint percent);
+JNIEXPORT jint JNICALL
+JVM_ElasticHeapGetUncommitIHOP(JNIEnv *env, jclass clazz);
+JNIEXPORT jlong JNICALL
+JVM_ElasticHeapGetTotalYoungUncommittedBytes(JNIEnv *env, jclass klass);
+JNIEXPORT void JNICALL
+JVM_ElasticHeapSetSoftmxPercent(JNIEnv *env, jclass clazz, jint percent);
+JNIEXPORT jint JNICALL
+JVM_ElasticHeapGetSoftmxPercent(JNIEnv *env, jclass clazz);
+JNIEXPORT jlong JNICALL
+JVM_ElasticHeapGetTotalUncommittedBytes(JNIEnv *env, jclass clazz);
+
+JNIEXPORT void JNICALL
+JVM_SetWispTask(JNIEnv* env, jclass clz, jlong coroutinePtr, jint task_id, jobject task, jobject engine);
+
+JNIEXPORT jint JNICALL
+JVM_GetProxyUnpark(JNIEnv* env, jclass clz, jintArray res);
+
+JNIEXPORT void JNICALL
+JVM_MarkPreempted(JNIEnv* env, jclass clz, jobject thread, jboolean force);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -482,6 +482,8 @@ class os: AllStatic {
   static void initialize_thread(Thread* thr);
   static void free_thread(OSThread* osthread);
 
+  static bool is_signal_dispatcher_thread(JavaThread* thread);
+
   // thread id on Linux/64bit is 64bit, on Windows and Solaris, it's 32bit
   static intx current_thread_id();
   static int current_process_id();
@@ -556,6 +558,7 @@ class os: AllStatic {
   //File i/o operations
 
   static size_t read(int fd, void *buf, unsigned int nBytes);
+  static size_t read_at(int fd, void *buf, unsigned int nBytes, jlong offset);
   static size_t restartable_read(int fd, void *buf, unsigned int nBytes);
   static size_t write(int fd, const void *buf, unsigned int nBytes);
 
@@ -603,6 +606,16 @@ class os: AllStatic {
 
   // Unload library
   static void  dll_unload(void *lib);
+
+  // Callback for loaded module information
+  // Input parameters:
+  //    char*     module_file_name,
+  //    address   module_base_addr,
+  //    address   module_top_addr,
+  //    void*     param
+  typedef int (*LoadedModulesCallbackFunc)(const char *, address, address, void *);
+
+  static int get_loaded_modules_info(LoadedModulesCallbackFunc callback, void *param);
 
   // Return the handle of this process
   static void* get_default_process_handle();

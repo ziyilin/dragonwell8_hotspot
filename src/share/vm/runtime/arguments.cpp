@@ -48,6 +48,9 @@
 #include <ctype.h>
 #include <utilities/growableArray.hpp>
 #endif
+#if INCLUDE_JFR
+#include "jfr/jfr.hpp"
+#endif
 #ifdef TARGET_OS_FAMILY_linux
 # include "os_linux.inline.hpp"
 #endif
@@ -158,6 +161,20 @@ static bool match_option(const JavaVMOption *option, const char* name,
     return false;
   }
 }
+
+#if INCLUDE_JFR
+// return true on failure
+static bool match_jfr_option(const JavaVMOption** option) {
+  assert((*option)->optionString != NULL, "invariant");
+  char* tail = NULL;
+  if (match_option(*option, "-XX:StartFlightRecording", (const char**)&tail)) {
+    return Jfr::on_start_flight_recording_option(option, tail);
+  } else if (match_option(*option, "-XX:FlightRecorderOptions", (const char**)&tail)) {
+    return Jfr::on_flight_recorder_option(option, tail);
+  }
+  return false;
+}
+#endif
 
 static void logOption(const char* opt) {
   if (PrintVMOptions) {
@@ -306,9 +323,10 @@ static ObsoleteFlag obsolete_jvm_flags[] = {
   { "UsePermISM",                    JDK_Version::jdk(8), JDK_Version::jdk(9) },
   { "UseMPSS",                       JDK_Version::jdk(8), JDK_Version::jdk(9) },
   { "UseStringCache",                JDK_Version::jdk(8), JDK_Version::jdk(9) },
-  { "UseOldInlining",                JDK_Version::jdk(9), JDK_Version::jdk(10) },
-  { "AutoShutdownNMT",               JDK_Version::jdk(9), JDK_Version::jdk(10) },
+  { "UseOldInlining",                JDK_Version::jdk_update(8, 20), JDK_Version::jdk(10) },
+  { "AutoShutdownNMT",               JDK_Version::jdk_update(8, 40), JDK_Version::jdk(10) },
   { "CompilationRepeat",             JDK_Version::jdk(8), JDK_Version::jdk(9) },
+  { "SegmentedHeapDumpThreshold",    JDK_Version::jdk_update(8, 252), JDK_Version::jdk(10) },
 #ifdef PRODUCT
   { "DesiredMethodLimit",
                            JDK_Version::jdk_update(7, 2), JDK_Version::jdk(8) },
@@ -1589,7 +1607,7 @@ void Arguments::select_gc_ergonomically() {
 
 void Arguments::select_gc() {
   if (!gc_selected()) {
-    select_gc_ergonomically();
+    FLAG_SET_ERGO(bool, UseConcMarkSweepGC, true);
   }
 }
 
@@ -2302,6 +2320,33 @@ bool Arguments::check_vm_args_consistency() {
   // before returning an error.
   // Note: Needs platform-dependent factoring.
   bool status = true;
+
+  if (G1ElasticHeap) {
+    if (!UseG1GC) {
+      vm_exit_during_initialization("G1ElasticHeap only works with UseG1GC");
+    }
+    status = status && verify_interval(ElasticHeapMinYoungCommitPercent, 1, 100, "ElasticHeapMinYoungCommitPercent");
+    status = status && verify_interval(ElasticHeapPeriodicMinYoungCommitPercent, ElasticHeapMinYoungCommitPercent, 100, "ElasticHeapMinYoungCommitPercentAuto");
+    PropertyList_unique_add(&_system_properties, "com.alibaba.jvm.gc.ElasticHeapEnabled", (char*)"true");
+    status = status && verify_interval(ElasticHeapOldGenReservePercent, 1, 100, "ElasticHeapOldGenReservePercent");
+
+    if (InitialHeapSize != MaxHeapSize) {
+      jio_fprintf(defaultStream::error_stream(),
+                  "G1ElasticHeap requires Xms:"
+                  SIZE_FORMAT
+                  " bytes same to Xmx: "
+                  SIZE_FORMAT
+                  " bytes",
+                  InitialHeapSize, MaxHeapSize);
+      status = false;
+    }
+  }
+
+  if (ElasticHeapPeriodicUncommit) {
+    if (!G1ElasticHeap) {
+      vm_exit_during_initialization("ElasticHeapPeriodicUncommit only works with G1ElasticHeap");
+    }
+  }
 
   // Allow both -XX:-UseStackBanging and -XX:-UseBoundThreads in non-product
   // builds so the cost of stack banging can be measured.
@@ -3409,6 +3454,10 @@ jint Arguments::parse_each_vm_init_arg(const JavaVMInitArgs* args,
           "ManagementServer is not supported in this VM.\n");
         return JNI_ERR;
 #endif // INCLUDE_MANAGEMENT
+#if INCLUDE_JFR
+    } else if (match_jfr_option(&option)) {
+      return JNI_EINVAL;
+#endif
     } else if (match_option(option, "-XX:", &tail)) { // -XX:xxxx
       // Skip -XX:Flags= since that case has already been handled
       if (strncmp(tail, "Flags=", strlen("Flags=")) != 0) {
@@ -3464,8 +3513,7 @@ void Arguments::fix_appclasspath() {
       src ++;
     }
 
-    char* copy = AllocateHeap(strlen(src) + 1, mtInternal);
-    strncpy(copy, src, strlen(src) + 1);
+    char* copy = os::strdup(src, mtInternal);
 
     // trim all trailing empty paths
     for (char* tail = copy + strlen(copy) - 1; tail >= copy && *tail == separator; tail--) {
@@ -3844,18 +3892,14 @@ static char* get_shared_archive_path() {
     if (end != NULL) *end = '\0';
     size_t jvm_path_len = strlen(jvm_path);
     size_t file_sep_len = strlen(os::file_separator());
-    shared_archive_path = NEW_C_HEAP_ARRAY(char, jvm_path_len +
-        file_sep_len + 20, mtInternal);
+    const size_t len = jvm_path_len + file_sep_len + 20;
+    shared_archive_path = NEW_C_HEAP_ARRAY(char, len, mtInternal);
     if (shared_archive_path != NULL) {
-      strncpy(shared_archive_path, jvm_path, jvm_path_len + 1);
-      strncat(shared_archive_path, os::file_separator(), file_sep_len);
-      strncat(shared_archive_path, "classes.jsa", 11);
+      jio_snprintf(shared_archive_path, len, "%s%sclasses.jsa",
+        jvm_path, os::file_separator());
     }
   } else {
-    shared_archive_path = NEW_C_HEAP_ARRAY(char, strlen(SharedArchiveFile) + 1, mtInternal);
-    if (shared_archive_path != NULL) {
-      strncpy(shared_archive_path, SharedArchiveFile, strlen(SharedArchiveFile) + 1);
-    }
+    shared_archive_path = os::strdup(SharedArchiveFile, mtInternal);
   }
   return shared_archive_path;
 }
@@ -4066,6 +4110,43 @@ jint Arguments::parse(const JavaVMInitArgs* args) {
       FLAG_SET_DEFAULT(PrintGCCause, false);
     }
   }
+
+  if (UseWisp2) {
+    // check Compatibility
+    if (!EnableCoroutine && FLAG_IS_CMDLINE(EnableCoroutine)) {
+      warning("Wisp2 needs to enable -XX:+EnableCoroutine"
+              "; ignoring -XX:-EnableCoroutine." );
+    }
+    if (!UseWispMonitor && FLAG_IS_CMDLINE(UseWispMonitor)) {
+      warning("Wisp2 needs to enable -XX:+UseWispMonitor"
+              "; ignoring -XX:-UseWispMonitor." );
+    }
+    if (UseBiasedLocking && FLAG_IS_CMDLINE(UseBiasedLocking)) {
+      warning("Biased Locking is not supported with Wisp2"
+              "; ignoring UseBiasedLocking flag." );
+    }
+    // Turn on -XX:+EnableCoroutine, -XX:+UseWispMonitor
+    EnableCoroutine = true;
+    UseWispMonitor = true;
+    // Turn off -XX:-UseBiasedLocking
+    UseBiasedLocking = false;
+  } else {
+    if (EnableCoroutine) {
+      if (UseBiasedLocking && FLAG_IS_CMDLINE(UseBiasedLocking)) {
+        warning("Biased Locking is not supported with Wisp"
+                "; ignoring UseBiasedLocking flag." );
+      }
+      UseBiasedLocking = false;
+    }
+  }
+
+#ifndef LINUX
+  if (EnableCoroutine || UseWispMonitor) {
+    warning("Wisp supports Linux only"
+            "; ignore Wisp related flags");
+    EnableCoroutine = UseWispMonitor = false;
+  }
+#endif
 
   // Set object alignment values.
   set_object_alignment();

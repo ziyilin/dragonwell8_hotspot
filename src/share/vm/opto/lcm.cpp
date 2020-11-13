@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 2015, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1998, 2016, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -97,6 +97,9 @@ void PhaseCFG::implicit_null_check(Block* block, Node *proj, Node *val, int allo
   // Intel solaris doesn't support any null checks yet and no
   // mechanism exists (yet) to set the switches at an os_cpu level
   if( !ImplicitNullChecks || MacroAssembler::needs_explicit_null_check(0)) return;
+
+  // to reduce deoptimization, disable implicit_null_check for jwarmup compilation
+  if (CompilationWarmUp && this->C->env()->task()->is_jwarmup_compilation()) return;
 
   // Make sure the ptr-is-null path appears to be uncommon!
   float f = block->end()->as_MachIf()->_prob;
@@ -817,6 +820,13 @@ bool PhaseCFG::schedule_local(Block* block, GrowableArray<int>& ready_cnt, Vecto
         // and the edge will be lost. This is why this code should be
         // executed only when Precedent (== TypeFunc::Parms) edge is present.
         Node *x = n->in(TypeFunc::Parms);
+        if (x != NULL && get_block_for_node(x) == block && n->find_prec_edge(x) != -1) {
+          // Old edge to node within same block will get removed, but no precedence
+          // edge will get added because it already exists. Update ready count.
+          int cnt = ready_cnt.at(n->_idx);
+          assert(cnt > 1, err_msg("MemBar node %d must not get ready here", n->_idx));
+          ready_cnt.at_put(n->_idx, cnt-1);
+        }
         n->del_req(TypeFunc::Parms);
         n->add_prec(x);
       }
@@ -956,6 +966,8 @@ bool PhaseCFG::schedule_local(Block* block, GrowableArray<int>& ready_cnt, Vecto
       // If this is the first failure, the sentinel string will "stick"
       // to the Compile object, and the C2Compiler will see it and retry.
       C->record_failure(C2Compiler::retry_no_subsuming_loads());
+    } else {
+      assert(false, "graph should be schedulable");
     }
     // assert( phi_cnt == end_idx(), "did not schedule all" );
     return false;

@@ -34,6 +34,7 @@
 #include "compiler/compilerOracle.hpp"
 #include "compiler/disassembler.hpp"
 #include "interpreter/bytecode.hpp"
+#include "jwarmup/jitWarmUp.hpp"
 #include "oops/methodData.hpp"
 #include "prims/jvmtiRedefineClassesTrace.hpp"
 #include "prims/jvmtiImpl.hpp"
@@ -648,6 +649,10 @@ nmethod* nmethod::new_nmethod(methodHandle method,
     // Safepoints in nmethod::verify aren't allowed because nm hasn't been installed yet.
     DEBUG_ONLY(nm->verify();)
     nm->log_new_nmethod();
+  }
+  if (CompilationWarmUpRecording && nm != NULL && comp_level >= CompilationWarmUpRecordMinLevel) {
+    int bci = nm->is_osr_method() ? nm->osr_entry_bci() : InvocationEntryBci;
+    JitWarmUp::instance()->recorder()->add_method(nm->method(), bci);
   }
   return nm;
 }
@@ -1432,6 +1437,19 @@ void nmethod::log_state_change() const {
 bool nmethod::make_not_entrant_or_zombie(unsigned int state) {
   assert(state == zombie || state == not_entrant, "must be zombie or not_entrant");
   assert(!is_zombie(), "should not already be a zombie");
+
+  if (EnableCoroutine && method() != NULL) {
+    // do not deal with intrinsic methods of coroutine klass
+    assert(!is_unloaded(), "wrong state");
+    vmIntrinsics::ID intrinsic_id = method()->intrinsic_id();
+    if (intrinsic_id == vmIntrinsics::_switchTo ||
+        intrinsic_id == vmIntrinsics::_switchToAndExit ||
+        intrinsic_id == vmIntrinsics::_switchToAndTerminate) {
+      assert(method()->constants()->pool_holder() == SystemDictionary::java_dyn_CoroutineSupport_klass(), "wrong method!");
+      assert(state == not_entrant, "wrong state");
+      return false;
+    }
+  }
 
   // Make sure neither the nmethod nor the method is flushed in case of a safepoint in code below.
   nmethodLocker nml(this);

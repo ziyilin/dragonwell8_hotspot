@@ -38,6 +38,7 @@
 class HeapRegion;
 class CollectionSetChooser;
 class G1GCPhaseTimes;
+class ElasticHeap;
 
 // TraceGen0Time collects data on _both_ young and mixed evacuation pauses
 // (the latter may contain non-young regions - i.e. regions that are
@@ -161,9 +162,17 @@ public:
   bool adaptive_young_list_length() {
     return _adaptive_size;
   }
+  void resize_min_desired_young_length(uint size) {
+    _min_desired_young_length = size;
+  }
+  void resize_max_desired_young_length(uint size) {
+    _max_desired_young_length = size;
+  }
 };
 
 class G1CollectorPolicy: public CollectorPolicy {
+  friend class ElasticHeap;
+  friend class ElasticHeapEvaluator;
 private:
   // either equal to the number of parallel threads, if ParallelGCThreads
   // has been set, or 1 otherwise
@@ -676,7 +685,7 @@ public:
   bool need_to_start_conc_mark(const char* source, size_t alloc_word_size = 0);
 
   // Record the start and end of an evacuation pause.
-  void record_collection_pause_start(double start_time_sec);
+  void record_collection_pause_start(double start_time_sec, GCTracer &tracer);
   void record_collection_pause_end(double pause_time_ms, EvacuationInfo& evacuation_info);
 
   // Record the start and end of a full collection.
@@ -842,6 +851,10 @@ public:
     _gcs_are_young = gcs_are_young;
   }
 
+  bool last_young_gc() const {
+    return _last_young_gc;
+  }
+
   bool adaptive_young_list_length() {
     return _young_gen_sizer->adaptive_young_list_length();
   }
@@ -924,7 +937,7 @@ public:
   void update_max_gc_locker_expansion();
 
   // Calculates survivor space parameters.
-  void update_survivors_policy();
+  void update_survivors_policy(GCTracer &tracer);
 
   virtual void post_heap_initialize();
 };

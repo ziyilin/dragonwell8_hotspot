@@ -248,7 +248,8 @@ void Compile::Insert_zap_nodes() {
               call->entry_point() == OptoRuntime::multianewarray4_Java() ||
               call->entry_point() == OptoRuntime::multianewarray5_Java() ||
               call->entry_point() == OptoRuntime::slow_arraycopy_Java() ||
-              call->entry_point() == OptoRuntime::complete_monitor_locking_Java()
+              call->entry_point() == OptoRuntime::complete_monitor_locking_Java() ||
+              call->entry_point() == OptoRuntime::complete_wisp_monitor_unlocking_Java()
               ) {
             insert = false;
           }
@@ -1672,6 +1673,8 @@ void Compile::fill_buffer(CodeBuffer* cb, uint* blk_starts) {
       }
       if (method() != NULL) {
         method()->print_metadata();
+      } else if (stub_name() != NULL) {
+        tty->print_cr("Generating RuntimeStub - %s", stub_name());
       }
       dump_asm(node_offsets, node_offset_limit);
       if (xtty != NULL) {

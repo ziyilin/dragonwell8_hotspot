@@ -202,7 +202,7 @@ class fileStream : public outputStream {
   fileStream(const char* file_name);
   fileStream(const char* file_name, const char* opentype);
   fileStream(FILE* file, bool need_close = false) { _file = file; _need_close = need_close; }
-  ~fileStream();
+  virtual ~fileStream();
   bool is_open() const { return _file != NULL; }
   void set_need_close(bool b) { _need_close = b;}
   virtual void write(const char* c, size_t len);
@@ -212,6 +212,20 @@ class fileStream : public outputStream {
   long fileSize();
   void rewind() { ::rewind(_file); }
   void flush();
+};
+
+class randomAccessFileStream : public fileStream {
+ public:
+  randomAccessFileStream();
+  randomAccessFileStream(const char* file_name);
+  randomAccessFileStream(const char* file_name, const char* opentype);
+  randomAccessFileStream(FILE* file, bool need_close = false);
+  virtual ~randomAccessFileStream() {  }
+  virtual void write(const char* c, size_t len);
+  // random write support, write data to specified position
+  virtual void write(const char* c, size_t len, long pos);
+  int fseek(long offset, int pos) { return ::fseek(_file, offset, pos); }
+  long ftell() { return ::ftell(_file); }
 };
 
 CDS_ONLY(extern fileStream*   classlist_file;)
@@ -235,11 +249,15 @@ class fdStream : public outputStream {
   void flush() {};
 };
 
+class Mutex;
 class gcLogFileStream : public fileStream {
  protected:
   const char*  _file_name;
   jlong  _bytes_written;
   uintx  _cur_file_num;             // current logfile rotation number, from 0 to NumberOfGCLogFiles-1
+ private:
+  Mutex* _file_lock;
+  void rotate_log_impl(bool force, outputStream* out);
  public:
   gcLogFileStream(const char* file_name);
   ~gcLogFileStream();

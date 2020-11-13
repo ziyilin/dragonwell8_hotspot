@@ -44,6 +44,7 @@ VM_G1CollectForAllocation::VM_G1CollectForAllocation(uint gc_count_before,
 void VM_G1CollectForAllocation::doit() {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   GCCauseSetter x(g1h, _gc_cause);
+  G1ContextCauseSetter set_ctxt(g1h, this->allocation_context());
 
   _result = g1h->satisfy_failed_allocation(_word_size, allocation_context(), &_pause_succeeded);
   assert(_result == NULL || _pause_succeeded,
@@ -53,6 +54,7 @@ void VM_G1CollectForAllocation::doit() {
 void VM_G1CollectFull::doit() {
   G1CollectedHeap* g1h = G1CollectedHeap::heap();
   GCCauseSetter x(g1h, _gc_cause);
+  G1ContextCauseSetter set_ctxt(g1h, this->allocation_context());
   g1h->do_full_collection(false /* clear_all_soft_refs */);
 }
 
@@ -94,6 +96,8 @@ void VM_G1IncCollectionPause::doit() {
       "only a GC locker, a System.gc(), stats update, whitebox, or a hum allocation induced GC should start a cycle");
 
   if (_word_size > 0) {
+    AllocationContextMark acm(this->allocation_context());
+
     // An allocation has been requested. So, try to do that first.
     _result = g1h->attempt_allocation_at_safepoint(_word_size, allocation_context(),
                                      false /* expect_null_cur_alloc_region */);
@@ -106,6 +110,7 @@ void VM_G1IncCollectionPause::doit() {
   }
 
   GCCauseSetter x(g1h, _gc_cause);
+  G1ContextCauseSetter set_ctxt(g1h, this->allocation_context());
   if (_should_initiate_conc_mark) {
     // It's safer to read old_marking_cycles_completed() here, given
     // that noone else will be updating it concurrently. Since we'll
@@ -147,6 +152,7 @@ void VM_G1IncCollectionPause::doit() {
   _pause_succeeded =
     g1h->do_collection_pause_at_safepoint(_target_pause_time_ms);
   if (_pause_succeeded && _word_size > 0) {
+    AllocationContextMark acm(this->allocation_context());
     // An allocation had been requested.
     _result = g1h->attempt_allocation_at_safepoint(_word_size, allocation_context(),
                                       true /* expect_null_cur_alloc_region */);

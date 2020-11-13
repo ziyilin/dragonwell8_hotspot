@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001, 2014, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -551,10 +551,10 @@ HeapWord* DefNewGeneration::expand_and_allocate(size_t size,
   return allocate(size, is_tlab);
 }
 
-void DefNewGeneration::adjust_desired_tenuring_threshold() {
+void DefNewGeneration::adjust_desired_tenuring_threshold(GCTracer &tracer) {
   // Set the desired survivor size to half the real survivor space
   _tenuring_threshold =
-    age_table()->compute_tenuring_threshold(to()->capacity()/HeapWordSize);
+    age_table()->compute_tenuring_threshold(to()->capacity()/HeapWordSize, tracer);
 }
 
 void DefNewGeneration::collect(bool   full,
@@ -625,6 +625,8 @@ void DefNewGeneration::collect(bool   full,
   assert(gch->no_allocs_since_save_marks(0),
          "save marks have not been newly set.");
 
+  GenGCPhaseTimes* phase_times = gch->gen_policy()->phase_times();
+  phase_times->note_gc_start(1);
   gch->gen_process_roots(_level,
                          true,  // Process younger gens, if any,
                                 // as strong roots.
@@ -633,7 +635,9 @@ void DefNewGeneration::collect(bool   full,
                          GenCollectedHeap::StrongAndWeakRoots,
                          &fsc_with_no_gc_barrier,
                          &fsc_with_gc_barrier,
-                         &cld_scan_closure);
+                         &cld_scan_closure,
+                         phase_times,
+                         0);
 
   // "evacuate followers".
   evacuate_followers.do_void();
@@ -664,7 +668,7 @@ void DefNewGeneration::collect(bool   full,
 
     assert(to()->is_empty(), "to space should be empty now");
 
-    adjust_desired_tenuring_threshold();
+    adjust_desired_tenuring_threshold(gc_tracer);
 
     // A successful scavenge should restart the GC time limit count which is
     // for full GC's.

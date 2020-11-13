@@ -27,6 +27,7 @@
 
 #include "classfile/classFileStream.hpp"
 #include "classfile/classLoader.hpp"
+#include "jwarmup/jitWarmUp.hpp"
 #include "oops/objArrayOop.hpp"
 #include "oops/symbol.hpp"
 #include "runtime/java.hpp"
@@ -77,7 +78,6 @@ class LoaderConstraintTable;
 template <MEMFLAGS F> class HashtableBucket;
 class ResolutionErrorTable;
 class SymbolPropertyTable;
-class Ticks;
 
 // Certain classes are preloaded, such as java.lang.Object and java.lang.String.
 // They are all "well-known", in the sense that no class loader is allowed
@@ -131,6 +131,14 @@ class Ticks;
   do_klass(Cleaner_klass,                               sun_misc_Cleaner,                          Pre                 ) \
   do_klass(Finalizer_klass,                             java_lang_ref_Finalizer,                   Pre                 ) \
   do_klass(ReferenceQueue_klass,                        java_lang_ref_ReferenceQueue,              Pre                 ) \
+                                                                                                                         \
+    /* support for multi-tenant feature */                                                                               \
+  do_klass(com_alibaba_tenant_TenantGlobals_klass,      com_alibaba_tenant_TenantGlobals,          Pre_Tenant          ) \
+  do_klass(com_alibaba_tenant_TenantConfiguration_klass,com_alibaba_tenant_TenantConfiguration,    Pre_Tenant          ) \
+  do_klass(com_alibaba_tenant_TenantState_klass,        com_alibaba_tenant_TenantState,            Pre_Tenant          ) \
+  do_klass(com_alibaba_tenant_TenantException_klass,    com_alibaba_tenant_TenantException,        Pre_Tenant          ) \
+  do_klass(com_alibaba_tenant_TenantContainer_klass,    com_alibaba_tenant_TenantContainer,        Pre_Tenant          ) \
+  /* Note: TenantGlobals must be first, and TenantContainer last in group */                                             \
                                                                                                                          \
   do_klass(Thread_klass,                                java_lang_Thread,                          Pre                 ) \
   do_klass(ThreadGroup_klass,                           java_lang_ThreadGroup,                     Pre                 ) \
@@ -196,12 +204,24 @@ class Ticks;
   do_klass(Short_klass,                                 java_lang_Short,                           Pre                 ) \
   do_klass(Integer_klass,                               java_lang_Integer,                         Pre                 ) \
   do_klass(Long_klass,                                  java_lang_Long,                            Pre                 ) \
+                                                                                                                         \
+  /* Stack manipulation classes */                                                                                       \
+  do_klass(java_dyn_CoroutineSupport_klass,             java_dyn_CoroutineSupport,                 Opt                 ) \
+  do_klass(java_dyn_CoroutineBase_klass,                java_dyn_CoroutineBase,                    Opt                 ) \
+  do_klass(com_alibaba_wisp_engine_WispTask_klass,      com_alibaba_wisp_engine_WispTask,          Opt                 ) \
+  do_klass(com_alibaba_wisp_engine_WispTask_CacheableCoroutine_klass,                                                    \
+                                                        com_alibaba_wisp_engine_WispTask_CacheableCoroutine, Opt       ) \
+  do_klass(com_alibaba_wisp_engine_WispEngine_klass,    com_alibaba_wisp_engine_WispEngine,        Opt                 ) \
+  do_klass(com_alibaba_wisp_engine_WispCarrier_klass,   com_alibaba_wisp_engine_WispCarrier,       Opt                 ) \
+  do_klass(com_alibaba_wisp_engine_WispEventPump_klass, com_alibaba_wisp_engine_WispEventPump,     Opt                 ) \
   /*end*/
 
 
 class SystemDictionary : AllStatic {
   friend class VMStructs;
   friend class SystemDictionaryHandles;
+  friend class JitWarmUp;
+  friend class PreloadJitInfo;
 
  public:
   enum WKID {
@@ -219,6 +239,7 @@ class SystemDictionary : AllStatic {
   enum InitOption {
     Pre,                        // preloaded; error if not present
     Pre_JSR292,                 // preloaded if EnableInvokeDynamic
+    Pre_Tenant,                 // preloaded if MultiTenant
 
     // Order is significant.  Options before this point require resolve_or_fail.
     // Options after this point will use resolve_or_null instead.
@@ -242,7 +263,7 @@ class SystemDictionary : AllStatic {
   static Klass* resolve_or_fail(Symbol* class_name, bool throw_error, TRAPS);
 protected:
   // handle error translation for resolve_or_null results
-  static Klass* handle_resolution_exception(Symbol* class_name, Handle class_loader, Handle protection_domain, bool throw_error, KlassHandle klass_h, TRAPS);
+  static Klass* handle_resolution_exception(Symbol* class_name, bool throw_error, KlassHandle klass_h, TRAPS);
 
 public:
 
@@ -405,6 +426,7 @@ public:
 
   static Klass* check_klass_Pre(       Klass* k) { return check_klass(k); }
   static Klass* check_klass_Pre_JSR292(Klass* k) { return EnableInvokeDynamic ? check_klass(k) : k; }
+  static Klass* check_klass_Pre_Tenant(Klass* k) { return MultiTenant ? check_klass(k) : k; }
   static Klass* check_klass_Opt(       Klass* k) { return k; }
   static Klass* check_klass_Opt_Only_JDK15(Klass* k) {
     assert(JDK_Version::is_gte_jdk15x_version(), "JDK 1.5 only");
@@ -550,9 +572,11 @@ public:
 
   // Record the error when the first attempt to resolve a reference from a constant
   // pool entry to a class fails.
-  static void add_resolution_error(constantPoolHandle pool, int which, Symbol* error);
+  static void add_resolution_error(constantPoolHandle pool, int which, Symbol* error,
+                                   Symbol* message);
   static void delete_resolution_error(ConstantPool* pool);
-  static Symbol* find_resolution_error(constantPoolHandle pool, int which);
+  static Symbol* find_resolution_error(constantPoolHandle pool, int which,
+                                       Symbol** message);
 
  protected:
 
@@ -627,7 +651,7 @@ protected:
   // waiting; relocks lockObject with correct recursion count
   // after waiting, but before reentering SystemDictionary_lock
   // to preserve lock order semantics.
-  static void double_lock_wait(Handle lockObject, TRAPS);
+  static void double_lock_wait(SystemDictLocker* mu, Handle lockObject, TRAPS);
   static void define_instance_class(instanceKlassHandle k, TRAPS);
   static instanceKlassHandle find_or_define_instance_class(Symbol* class_name,
                                                 Handle class_loader,
@@ -654,9 +678,6 @@ protected:
   // Setup link to hierarchy
   static void add_to_hierarchy(instanceKlassHandle k, TRAPS);
 
-  // event based tracing
-  static void post_class_load_event(const Ticks& start_time, instanceKlassHandle k,
-                                    Handle initiating_loader);
   // We pass in the hashtable index so we can calculate it outside of
   // the SystemDictionary_lock.
 
@@ -713,6 +734,9 @@ protected:
 
   static bool _has_loadClassInternal;
   static bool _has_checkPackageAccess;
+
+public:
+  static void system_dict_lock_change(TRAPS);
 };
 
 #endif // SHARE_VM_CLASSFILE_SYSTEMDICTIONARY_HPP

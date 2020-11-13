@@ -183,6 +183,8 @@ class frame VALUE_OBJ_CLASS_SPEC {
   frame sender_for_interpreter_frame(RegisterMap* map) const;
   frame sender_for_native_frame(RegisterMap* map) const;
 
+  bool is_entry_frame_valid(JavaThread* thread) const;
+
   // All frames:
 
   // A low-level interface for vframes:
@@ -562,6 +564,7 @@ class StackFrameStream : public StackObj {
   bool        _is_done;
  public:
    StackFrameStream(JavaThread *thread, bool update = true);
+   StackFrameStream(JavaThread *thread, frame last_frame, bool update = true);
 
   // Iteration
   bool is_done()                  { return (_is_done) ? true : (_is_done = _fr.is_first_frame(), false); }

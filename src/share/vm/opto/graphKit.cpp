@@ -829,13 +829,13 @@ static bool should_reexecute_implied_by_bytecode(JVMState *jvms, bool is_anewarr
 }
 
 // Helper function for adding JVMState and debug information to node
-void GraphKit::add_safepoint_edges(SafePointNode* call, bool must_throw) {
+void GraphKit::add_safepoint_edges(SafePointNode* call, bool must_throw, bool is_wisp) {
   // Add the safepoint edges to the call (or other safepoint).
 
   // Make sure dead locals are set to top.  This
   // should help register allocation time and cut down on the size
   // of the deoptimization information.
-  assert(dead_locals_are_killed(), "garbage in debug info before safepoint");
+  assert(is_wisp || dead_locals_are_killed(), "garbage in debug info before safepoint");
 
   // Walk the inline list to fill in the correct set of JVMState's
   // Also fill in the associated edges for each JVMState.
@@ -864,7 +864,7 @@ void GraphKit::add_safepoint_edges(SafePointNode* call, bool must_throw) {
     }
   }
 
-  if (env()->jvmti_can_access_local_variables()) {
+  if (env()->should_retain_local_variables()) {
     // At any safepoint, this method can get breakpointed, which would
     // then require an immediate deoptimization.
     can_prune_locals = false;  // do not prune locals
@@ -877,7 +877,7 @@ void GraphKit::add_safepoint_edges(SafePointNode* call, bool must_throw) {
 
   // For a known set of bytecodes, the interpreter should reexecute them if
   // deoptimization happens. We set the reexecute state for them here
-  if (out_jvms->is_reexecute_undefined() && //don't change if already specified
+  if (!is_wisp && out_jvms->is_reexecute_undefined() && //don't change if already specified
       should_reexecute_implied_by_bytecode(out_jvms, call->is_AllocateArray())) {
     out_jvms->set_should_reexecute(true); //NOTE: youngest_jvms not changed
   }
@@ -2749,9 +2749,14 @@ bool GraphKit::seems_never_null(Node* obj, ciProfileData* data) {
       && obj != null()               // And not the -Xcomp stupid case?
       && !too_many_traps(Deoptimization::Reason_null_check)
       ) {
-    if (data == NULL)
+    bool compiledByWarmUp = CompilationWarmUp && this->C->env()->task()->is_jwarmup_compilation();
+    if (data == NULL) {
+      if (compiledByWarmUp) {
+        return false;
+      }
       // Edge case:  no mature data.  Be optimistic here.
       return true;
+    }
     // If the profile has not seen a null, assume it won't happen.
     assert(java_bc() == Bytecodes::_checkcast ||
            java_bc() == Bytecodes::_instanceof ||
@@ -2821,6 +2826,12 @@ Node* GraphKit::maybe_cast_profiled_obj(Node* obj,
                                         bool not_null) {
   // type == NULL if profiling tells us this object is always null
   if (type != NULL) {
+    if (CompilationWarmUp) {
+      if (this->C->env()->task()->is_jwarmup_compilation()) {
+        return obj;
+      }
+    }
+
     Deoptimization::DeoptReason class_reason = Deoptimization::Reason_speculate_class_check;
     Deoptimization::DeoptReason null_reason = Deoptimization::Reason_null_check;
     if (!too_many_traps(null_reason) && !too_many_recompiles(null_reason) &&
@@ -3154,6 +3165,8 @@ Node* GraphKit::insert_mem_bar_volatile(int opcode, int alias_idx, Node* precede
   return membar;
 }
 
+#define __ ideal.
+
 //------------------------------shared_lock------------------------------------
 // Emit locking code.
 FastLockNode* GraphKit::shared_lock(Node* obj) {
@@ -3255,6 +3268,9 @@ void GraphKit::shared_unlock(Node* box, Node* obj) {
   unlock->init_req(TypeFunc::Parms + 1, box);
   unlock = _gvn.transform(unlock)->as_Unlock();
 
+  if (UseWispMonitor && jvms()->has_method()) {
+    add_safepoint_edges(unlock, false, true);
+  }
   Node* mem = reset_memory();
 
   // unlock has no side-effects, sets few values

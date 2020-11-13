@@ -48,15 +48,17 @@ class ObjectWaiter : public StackObj {
   volatile TStates TState ;
   Sorted        _Sorted ;           // List placement disposition
   bool          _active ;           // Contention monitoring is enabled
+  int           _park_wisp_id;
+  bool          _using_wisp_park;
+  bool          _proxy_wisp_unpark;
+  long          _timeout;
+
  public:
   ObjectWaiter(Thread* thread);
 
   void wait_reenter_begin(ObjectMonitor *mon);
   void wait_reenter_end(ObjectMonitor *mon);
 };
-
-// forward declaration to avoid include tracing.hpp
-class EventJavaMonitorWait;
 
 // WARNING:
 //   This is a very sensitive and fragile class. DO NOT make any
@@ -224,10 +226,6 @@ public:
   void      ctAsserts () ;
   void      ExitEpilog (Thread * Self, ObjectWaiter * Wakee) ;
   bool      ExitSuspendEquivalent (JavaThread * Self) ;
-  void      post_monitor_wait_event(EventJavaMonitorWait * event,
-                                                   jlong notifier_tid,
-                                                   jlong timeout,
-                                                   bool timedout);
 
  private:
   friend class ObjectSynchronizer;

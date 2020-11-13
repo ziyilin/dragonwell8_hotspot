@@ -28,6 +28,7 @@
 #include "c1/c1_Instruction.hpp"
 #include "c1/c1_LIR.hpp"
 #include "ci/ciMethodData.hpp"
+#include "jfr/support/jfrIntrinsics.hpp"
 #include "utilities/sizes.hpp"
 
 // The classes responsible for code emission and register allocation
@@ -312,7 +313,7 @@ class LIRGenerator: public InstructionVisitor, public BlockClosure {
   // is_strictfp is only needed for mul and div (and only generates different code on i486)
   void arithmetic_op(Bytecodes::Code code, LIR_Opr result, LIR_Opr left, LIR_Opr right, bool is_strictfp, LIR_Opr tmp, CodeEmitInfo* info = NULL);
   // machine dependent.  returns true if it emitted code for the multiply
-  bool strength_reduce_multiply(LIR_Opr left, int constant, LIR_Opr result, LIR_Opr tmp);
+  bool strength_reduce_multiply(LIR_Opr left, jint constant, LIR_Opr result, LIR_Opr tmp);
 
   void store_stack_parameter (LIR_Opr opr, ByteSize offset_from_sp_in_bytes);
 
@@ -332,7 +333,7 @@ class LIRGenerator: public InstructionVisitor, public BlockClosure {
   void logic_op   (Bytecodes::Code code, LIR_Opr dst_reg, LIR_Opr left, LIR_Opr right);
 
   void monitor_enter (LIR_Opr object, LIR_Opr lock, LIR_Opr hdr, LIR_Opr scratch, int monitor_no, CodeEmitInfo* info_for_exception, CodeEmitInfo* info);
-  void monitor_exit  (LIR_Opr object, LIR_Opr lock, LIR_Opr hdr, LIR_Opr scratch, int monitor_no);
+  void monitor_exit  (LIR_Opr object, LIR_Opr lock, LIR_Opr hdr, LIR_Opr scratch, int monitor_no, CodeEmitInfo* info_for_exception = NULL, CodeEmitInfo* info = NULL);
 
   void new_instance    (LIR_Opr  dst, ciInstanceKlass* klass, bool is_unresolved, LIR_Opr  scratch1, LIR_Opr  scratch2, LIR_Opr  scratch3,  LIR_Opr scratch4, LIR_Opr  klass_reg, CodeEmitInfo* info);
 
@@ -440,9 +441,9 @@ class LIRGenerator: public InstructionVisitor, public BlockClosure {
   void do_SwitchRanges(SwitchRangeArray* x, LIR_Opr value, BlockBegin* default_sux);
 
   void do_RuntimeCall(address routine, int expected_arguments, Intrinsic* x);
-#ifdef TRACE_HAVE_INTRINSICS
-  void do_ThreadIDIntrinsic(Intrinsic* x);
+#ifdef JFR_HAVE_INTRINSICS
   void do_ClassIDIntrinsic(Intrinsic* x);
+  void do_getEventWriter(Intrinsic* x);
 #endif
   ciKlass* profile_type(ciMethodData* md, int md_first_offset, int md_offset, intptr_t profiled_k,
                         Value arg, LIR_Opr& mdp, bool not_null, ciKlass* signature_at_call_k,

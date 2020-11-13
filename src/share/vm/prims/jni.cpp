@@ -32,6 +32,8 @@
 #include "classfile/systemDictionary.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "interpreter/linkResolver.hpp"
+#include "jfr/jfrEvents.hpp"
+#include "jfr/support/jfrThreadId.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/ostream.hpp"
 #if INCLUDE_ALL_GCS
@@ -76,7 +78,6 @@
 #include "runtime/vm_operations.hpp"
 #include "services/memTracker.hpp"
 #include "services/runtimeService.hpp"
-#include "trace/tracing.hpp"
 #include "utilities/defaultStream.hpp"
 #include "utilities/dtrace.hpp"
 #include "utilities/events.hpp"
@@ -5019,6 +5020,24 @@ struct JNINativeInterface_* jni_functions_nocheck() {
   return &jni_NativeInterface;
 }
 
+static void post_thread_start_event(const JavaThread* jt) {
+  assert(jt != NULL, "invariant");
+  EventThreadStart event;
+  if (event.should_commit()) {
+    event.set_thread(JFR_THREAD_ID(jt));
+    event.set_parentThread((traceid)0);
+#if INCLUDE_JFR
+    if (EventThreadStart::is_stacktrace_enabled()) {
+      jt->jfr_thread_local()->set_cached_stack_trace_id((traceid)0);
+      event.commit();
+      jt->jfr_thread_local()->clear_cached_stack_trace();
+    } else
+#endif
+    {
+      event.commit();
+    }
+  }
+}
 
 // Invocation API
 
@@ -5101,6 +5120,7 @@ void TestVirtualSpaceNode_test();
 void TestNewSize_test();
 void TestKlass_test();
 void Test_linked_list();
+void TestResourcehash_test();
 void TestChunkedList_test();
 #if INCLUDE_ALL_GCS
 void TestOldFreeSpaceCalculation_test();
@@ -5133,6 +5153,7 @@ void execute_internal_vm_tests() {
     run_unit_test(test_snprintf());
     run_unit_test(TestNewSize_test());
     run_unit_test(TestKlass_test());
+    run_unit_test(TestResourcehash_test());
     run_unit_test(Test_linked_list());
     run_unit_test(TestChunkedList_test());
     run_unit_test(ObjectMonitor::sanity_checks());
@@ -5241,11 +5262,7 @@ _JNI_IMPORT_OR_EXPORT_ jint JNICALL JNI_CreateJavaVM(JavaVM **vm, void **penv, v
        JvmtiExport::post_thread_start(thread);
     }
 
-    EventThreadStart event;
-    if (event.should_commit()) {
-      event.set_javalangthread(java_lang_Thread::thread_id(thread->threadObj()));
-      event.commit();
-    }
+    post_thread_start_event(thread);
 
 #ifndef PRODUCT
   #ifndef CALL_TEST_FUNC_WITH_WRAPPER_IF_NEEDED
@@ -5390,7 +5407,9 @@ static jint attach_current_thread(JavaVM *vm, void **penv, void *_args, bool dae
   thread->set_thread_state(_thread_in_vm);
   // Must do this before initialize_thread_local_storage
   thread->record_stack_base_and_size();
-
+  if (EnableCoroutine) {
+    thread->initialize_coroutine_support();
+  }
   thread->initialize_thread_local_storage();
 
   if (!os::create_attached_thread(thread)) {
@@ -5456,13 +5475,13 @@ static jint attach_current_thread(JavaVM *vm, void **penv, void *_args, bool dae
     JvmtiExport::post_thread_start(thread);
   }
 
-  EventThreadStart event;
-  if (event.should_commit()) {
-    event.set_javalangthread(java_lang_Thread::thread_id(thread->threadObj()));
-    event.commit();
-  }
+  post_thread_start_event(thread);
 
   *(JNIEnv**)penv = thread->jni_environment();
+
+  if (EnableCoroutine) {
+    Coroutine::initialize_coroutine_support(JavaThread::current());
+  }
 
   // Now leaving the VM, so change thread_state. This is normally automatically taken care
   // of in the JVM_ENTRY. But in this situation we have to do it manually. Notice, that by
@@ -5607,6 +5626,10 @@ jint JNICALL jni_GetEnv(JavaVM *vm, void **penv, jint version) {
       ret = JNI_OK;
       return ret;
 
+    } else if (TENANT_ENV_VERSION_1_0 == version) { //get the tenant environment for java thread.
+      *(TenantEnv**)penv = ((JavaThread*) thread)->tenant_environment();
+      ret = JNI_OK;
+      return ret;
     } else if (version == JVMPI_VERSION_1 ||
                version == JVMPI_VERSION_1_1 ||
                version == JVMPI_VERSION_1_2) {

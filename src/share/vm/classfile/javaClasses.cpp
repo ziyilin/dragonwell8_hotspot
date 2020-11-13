@@ -52,6 +52,10 @@
 #include "runtime/vframe.hpp"
 #include "utilities/preserveException.hpp"
 
+#if INCLUDE_ALL_GCS
+#include "gc_implementation/g1/g1TenantAllocationContext.hpp"
+#endif  // INCLUDE_ALL_GCS
+
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
 
 #define INJECTED_FIELD_COMPUTE_OFFSET(klass, name, signature, may_be_java)    \
@@ -930,6 +934,7 @@ int java_lang_Thread::_tid_offset = 0;
 int java_lang_Thread::_thread_status_offset = 0;
 int java_lang_Thread::_park_blocker_offset = 0;
 int java_lang_Thread::_park_event_offset = 0 ;
+int java_lang_Thread::_inheritedTenantContainer_offset = 0 ;
 
 
 void java_lang_Thread::compute_offsets() {
@@ -953,6 +958,7 @@ void java_lang_Thread::compute_offsets() {
   compute_optional_offset(_park_blocker_offset, k, vmSymbols::park_blocker_name(), vmSymbols::object_signature());
   compute_optional_offset(_park_event_offset, k, vmSymbols::park_event_name(),
  vmSymbols::long_signature());
+  compute_offset(_inheritedTenantContainer_offset, k, vmSymbols::inheritedTenantContainer_name(), vmSymbols::tenantcontainer_signature());
 }
 
 
@@ -1025,6 +1031,9 @@ oop java_lang_Thread::inherited_access_control_context(oop java_thread) {
   return java_thread->obj_field(_inheritedAccessControlContext_offset);
 }
 
+oop java_lang_Thread::inherited_tenant_container(oop java_thread) {
+  return java_thread->obj_field(_inheritedTenantContainer_offset);
+}
 
 jlong java_lang_Thread::stackSize(oop java_thread) {
   // The stackSize field is only present starting in 1.4
@@ -1047,7 +1056,8 @@ void java_lang_Thread::set_thread_status(oop java_thread,
 
 // Read thread status value from threadStatus field in java.lang.Thread java class.
 java_lang_Thread::ThreadStatus java_lang_Thread::get_thread_status(oop java_thread) {
-  assert(Thread::current()->is_Watcher_thread() || Thread::current()->is_VM_thread() ||
+  assert(Threads_lock->owned_by_self() || Thread::current()->is_Watcher_thread() ||
+         Thread::current()->is_VM_thread() ||
          JavaThread::current()->thread_state() == _thread_in_vm,
          "Java Thread is not running in vm");
   // The threadStatus is only present starting in 1.5
@@ -1233,6 +1243,16 @@ oop java_lang_Throwable::message(Handle throwable) {
   return throwable->obj_field(detailMessage_offset);
 }
 
+
+// Return Symbol for detailed_message or NULL
+Symbol* java_lang_Throwable::detail_message(oop throwable) {
+  PRESERVE_EXCEPTION_MARK;  // Keep original exception
+  oop detailed_message = java_lang_Throwable::message(throwable);
+  if (detailed_message != NULL) {
+    return java_lang_String::as_symbol(detailed_message, THREAD);
+  }
+  return NULL;
+}
 
 void java_lang_Throwable::set_message(oop throwable, oop value) {
   throwable->obj_field_put(detailMessage_offset, value);
@@ -3242,6 +3262,13 @@ int java_lang_AssertionStatusDirectives::packages_offset;
 int java_lang_AssertionStatusDirectives::packageEnabled_offset;
 int java_lang_AssertionStatusDirectives::deflt_offset;
 int java_nio_Buffer::_limit_offset;
+#if INCLUDE_ALL_GCS
+int com_alibaba_tenant_TenantContainer::_allocation_context_offset;
+int com_alibaba_tenant_TenantContainer::_tenant_id_offset;
+int com_alibaba_tenant_TenantContainer::_tenant_state_offset;
+
+int com_alibaba_tenant_TenantState::_static_state_offsets[com_alibaba_tenant_TenantState::TS_SIZE] = { 0 };
+#endif // INCLUDE_ALL_GCS
 int java_util_concurrent_locks_AbstractOwnableSynchronizer::_owner_offset = 0;
 int sun_reflect_ConstantPool::_oop_offset;
 int sun_reflect_UnsafeStaticFieldAccessorImpl::_base_offset;
@@ -3299,6 +3326,177 @@ void java_nio_Buffer::compute_offsets() {
   Klass* k = SystemDictionary::nio_Buffer_klass();
   assert(k != NULL, "must be loaded in 1.4+");
   compute_offset(_limit_offset, k, vmSymbols::limit_name(), vmSymbols::int_signature());
+}
+
+#if INCLUDE_ALL_GCS
+
+// Support for com.alibaba.tenant.TenantContainer
+
+void com_alibaba_tenant_TenantContainer::compute_offsets() {
+  Klass* k = SystemDictionary::com_alibaba_tenant_TenantContainer_klass();
+  assert(k != NULL, "Cannot find TenantContainer in current JDK");
+  compute_offset(_tenant_id_offset, k, vmSymbols::tenant_id_address(), vmSymbols::long_signature());
+  compute_offset(_allocation_context_offset, k, vmSymbols::allocation_context_address(), vmSymbols::long_signature());
+  compute_offset(_tenant_state_offset, k, vmSymbols::state_name(), vmSymbols::com_alibaba_tenant_TenantState_signature());
+}
+
+jlong com_alibaba_tenant_TenantContainer::get_tenant_id(oop obj) {
+  assert(obj != NULL, "TenantContainer object cannot be NULL");
+  return obj->long_field(_tenant_id_offset);
+}
+
+G1TenantAllocationContext* com_alibaba_tenant_TenantContainer::get_tenant_allocation_context(oop obj) {
+  assert(obj != NULL, "TenantContainer object cannot be NULL");
+  return (G1TenantAllocationContext*)(obj->long_field(_allocation_context_offset));
+}
+
+void com_alibaba_tenant_TenantContainer::set_tenant_allocation_context(oop obj, G1TenantAllocationContext* context) {
+  assert(obj != NULL, "TenantContainer object cannot be NULL");
+  obj->long_field_put(_allocation_context_offset, (jlong)context);
+}
+
+bool com_alibaba_tenant_TenantContainer::is_dead(oop obj) {
+  assert(obj != NULL, "TenantContainer object cannot be NULL");
+  int state = com_alibaba_tenant_TenantState::state_of(obj);
+  return state == com_alibaba_tenant_TenantState::TS_STOPPING
+         || state == com_alibaba_tenant_TenantState::TS_DEAD;
+}
+
+oop com_alibaba_tenant_TenantContainer::get_tenant_state(oop obj) {
+  assert(obj != NULL, "TenantContainer object cannot be NULL");
+  return obj->obj_field(_tenant_state_offset);
+}
+
+// Support for com.alibaba.tenant.TenantState
+
+int com_alibaba_tenant_TenantState::state_of(oop tenant_obj) {
+  assert(tenant_obj != NULL, "TenantContainer ");
+
+  oop tenant_state = com_alibaba_tenant_TenantContainer::get_tenant_state(tenant_obj);
+  InstanceKlass* ik = InstanceKlass::cast(SystemDictionary::com_alibaba_tenant_TenantState_klass());
+
+  for (int i = TS_STARTING; i < TS_SIZE; ++i) {
+    assert(_static_state_offsets[i] == i * heapOopSize, "Must have been initialized");
+    address addr = ik->static_field_addr(_static_state_offsets[i]);
+    oop o = NULL;
+    if (UseCompressedOops) {
+      o = oopDesc::load_decode_heap_oop((narrowOop*)addr);
+    } else {
+      o = oopDesc::load_decode_heap_oop((oop*)addr);
+    }
+    assert(!oopDesc::is_null(o), "sanity");
+    if (tenant_state == o) {
+      return i;
+    }
+  }
+
+  ShouldNotReachHere();
+  return -1;
+}
+
+#endif // INCLUDE_ALL_GCS
+
+/* stack manipulation */
+
+int java_dyn_CoroutineBase::_data_offset = 0;
+
+void java_dyn_CoroutineBase::compute_offsets() {
+  Klass* k = SystemDictionary::java_dyn_CoroutineBase_klass();
+  if (k != NULL) {
+    compute_offset(_data_offset,    k, vmSymbols::nativeCoroutine_name(),    vmSymbols::long_signature());
+  }
+}
+
+jlong java_dyn_CoroutineBase::data(oop obj) {
+  return obj->long_field(_data_offset);
+}
+
+void java_dyn_CoroutineBase::set_data(oop obj, jlong value) {
+  obj->long_field_put(_data_offset, value);
+}
+
+int com_alibaba_wisp_engine_WispCarrier::_isInCritical_offset = 0;
+
+void com_alibaba_wisp_engine_WispCarrier::compute_offsets() {
+  Klass* k = SystemDictionary::com_alibaba_wisp_engine_WispCarrier_klass();
+  assert(k != NULL, "WispEngine_klass is null");
+  compute_offset(_isInCritical_offset,        k, vmSymbols::isInCritical_name(),         vmSymbols::bool_signature());
+}
+
+jboolean com_alibaba_wisp_engine_WispCarrier::in_critical(oop obj) {
+  return obj->bool_field(_isInCritical_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::_jvmParkStatus_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_jdkParkStatus_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_id_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_threadWrapper_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_interrupted_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_activeCount_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_stealCount_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_stealFailureCount_offset = 0;
+int com_alibaba_wisp_engine_WispTask::_preemptCount_offset = 0;
+
+void com_alibaba_wisp_engine_WispTask::compute_offsets() {
+  Klass* k = SystemDictionary::com_alibaba_wisp_engine_WispTask_klass();
+  assert(k != NULL, "WispTask_klass is null");
+  compute_offset(_jvmParkStatus_offset, k, vmSymbols::jvmParkStatus_name(),   vmSymbols::int_signature());
+  compute_offset(_jdkParkStatus_offset, k, vmSymbols::jdkParkStatus_name(),   vmSymbols::int_signature());
+  compute_offset(_id_offset,            k, vmSymbols::id_name(),              vmSymbols::int_signature());
+  compute_offset(_threadWrapper_offset, k, vmSymbols::threadWrapper_name(),   vmSymbols::thread_signature());
+  compute_offset(_interrupted_offset,   k, vmSymbols::interrupted_name(),     vmSymbols::int_signature());
+  compute_offset(_activeCount_offset,   k, vmSymbols::activeCount_name(),     vmSymbols::int_signature());
+  compute_offset(_stealCount_offset,    k, vmSymbols::stealCount_name(),      vmSymbols::int_signature());
+  compute_offset(_stealFailureCount_offset, k, vmSymbols::stealFailureCount_name(), vmSymbols::int_signature());
+  compute_offset(_preemptCount_offset,  k, vmSymbols::preemptCount_name(),    vmSymbols::int_signature());
+}
+
+void com_alibaba_wisp_engine_WispTask::set_jvmParkStatus(oop obj, jint status) {
+  obj->int_field_put(_jvmParkStatus_offset, status);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_jvmParkStatus(oop obj) {
+  return obj->int_field(_jvmParkStatus_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_jdkParkStatus(oop obj) {
+  return obj->int_field(_jdkParkStatus_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_id(oop obj) {
+  return obj->int_field(_id_offset);
+}
+
+oop com_alibaba_wisp_engine_WispTask::get_threadWrapper(oop obj) {
+  return obj->obj_field(_threadWrapper_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_interrupted(oop obj) {
+  return obj->int_field(_interrupted_offset);
+}
+
+void com_alibaba_wisp_engine_WispTask::set_interrupted(oop obj, jint interrupted) {
+  obj->int_field_put(_interrupted_offset, interrupted);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_activeCount(oop obj) {
+  return obj->int_field(_activeCount_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_stealCount(oop obj) {
+  return obj->int_field(_stealCount_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_stealFailureCount(oop obj) {
+  return obj->int_field(_stealFailureCount_offset);
+}
+
+int com_alibaba_wisp_engine_WispTask::get_preemptCount(oop obj) {
+  return obj->int_field(_preemptCount_offset);
+}
+
+void com_alibaba_wisp_engine_WispTask::set_preemptCount(oop obj, jint count) {
+  obj->int_field_put(_preemptCount_offset, count);
 }
 
 void java_util_concurrent_locks_AbstractOwnableSynchronizer::initialize(TRAPS) {
@@ -3410,6 +3608,16 @@ void JavaClasses::compute_offsets() {
 
   // generated interpreter code wants to know about the offsets we just computed:
   AbstractAssembler::update_delayed_values();
+
+  if (EnableCoroutine) {
+    java_dyn_CoroutineBase::compute_offsets();
+    com_alibaba_wisp_engine_WispCarrier::compute_offsets();
+    com_alibaba_wisp_engine_WispTask::compute_offsets();
+  }
+
+  if(MultiTenant) {
+    com_alibaba_tenant_TenantContainer::compute_offsets();
+  }
 }
 
 #ifndef PRODUCT

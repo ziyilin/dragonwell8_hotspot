@@ -32,7 +32,10 @@
 #include "interpreter/interpreter.hpp"
 #include "interpreter/linkResolver.hpp"
 #include "interpreter/oopMapCache.hpp"
+#include "jfr/jfrEvents.hpp"
 #include "jvmtifiles/jvmtiEnv.hpp"
+#include "jwarmup/jitWarmUp.hpp"
+#include "jwarmup/jitWarmUpThread.hpp"
 #include "memory/gcLocker.inline.hpp"
 #include "memory/metaspaceShared.hpp"
 #include "memory/oopFactory.hpp"
@@ -47,6 +50,7 @@
 #include "prims/privilegedStack.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/biasedLocking.hpp"
+#include "runtime/coroutine.hpp"
 #include "runtime/deoptimization.hpp"
 #include "runtime/fprofiler.hpp"
 #include "runtime/frame.inline.hpp"
@@ -77,8 +81,6 @@
 #include "services/management.hpp"
 #include "services/memTracker.hpp"
 #include "services/threadService.hpp"
-#include "trace/tracing.hpp"
-#include "trace/traceMacros.hpp"
 #include "utilities/defaultStream.hpp"
 #include "utilities/dtrace.hpp"
 #include "utilities/events.hpp"
@@ -100,6 +102,7 @@
 #include "gc_implementation/concurrentMarkSweep/concurrentMarkSweepThread.hpp"
 #include "gc_implementation/g1/concurrentMarkThread.inline.hpp"
 #include "gc_implementation/parallelScavenge/pcTasks.hpp"
+#include "gc_implementation/g1/elasticHeap.hpp"
 #endif // INCLUDE_ALL_GCS
 #ifdef COMPILER1
 #include "c1/c1_Compiler.hpp"
@@ -110,6 +113,9 @@
 #endif
 #if INCLUDE_RTM_OPT
 #include "runtime/rtmLocking.hpp"
+#endif
+#if INCLUDE_JFR
+#include "jfr/jfr.hpp"
 #endif
 
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
@@ -230,6 +236,7 @@ Thread::Thread() {
   set_active_handles(NULL);
   set_free_handle_block(NULL);
   set_last_handle_mark(NULL);
+  set_in_eagerly_loading_class(false);
 
   // This initial value ==> never claimed.
   _oops_do_parity = 0;
@@ -251,6 +258,7 @@ Thread::Thread() {
   _current_pending_monitor = NULL;
   _current_pending_monitor_is_from_java = true;
   _current_waiting_monitor = NULL;
+  _super_class_resolving_recursive_count = 0;
   _num_nested_signal = 0;
   omFreeList = NULL ;
   omFreeCount = 0 ;
@@ -301,6 +309,10 @@ Thread::Thread() {
            "bug in forced alignment of thread objects");
   }
 #endif /* ASSERT */
+
+  if (UseG1GC) {
+    _alloc_context = AllocationContext::system();
+  }
 }
 
 void Thread::initialize_thread_local_storage() {
@@ -341,8 +353,6 @@ void Thread::record_stack_base_and_size() {
 Thread::~Thread() {
   // Reclaim the objectmonitors from the omFreeList of the moribund thread.
   ObjectSynchronizer::omFlush (this) ;
-
-  EVENT_THREAD_DESTRUCT(this);
 
   // stack_base can be NULL if the thread is never started or exited before
   // record_stack_base_and_size called. Although, we would like to ensure
@@ -401,6 +411,9 @@ void Thread::run() {
 #ifdef ASSERT
 // Private method to check for dangling thread pointer
 void check_for_dangling_thread_pointer(Thread *thread) {
+ if (UseWispMonitor && thread->is_Wisp_thread()) {
+   thread = ((WispThread*) thread)->thread();
+ }
  assert(!thread->is_Java_thread() || Thread::current() == thread || Threads_lock->owned_by_self(),
          "possibility of dangling Thread pointer");
 }
@@ -836,7 +849,9 @@ bool Thread::claim_oops_do_par_case(int strong_roots_parity) {
 }
 
 void Thread::oops_do(OopClosure* f, CLDClosure* cld_f, CodeBlobClosure* cf) {
-  active_handles()->oops_do(f);
+  if (active_handles() != NULL) {
+    active_handles()->oops_do(f);
+  }
   // Do oop for ThreadShadow
   f->do_oop((oop*)&_pending_exception);
   handle_area()->oops_do(f);
@@ -960,7 +975,7 @@ bool Thread::is_in_stack(address adr) const {
   address end = os::current_stack_pointer();
   // Allow non Java threads to call this without stack_base
   if (_stack_base == NULL) return true;
-  if (stack_base() >= adr && adr >= end) return true;
+  if (stack_base() > adr && adr >= end) return true;
 
   return false;
 }
@@ -1056,6 +1071,43 @@ static void call_initializeSystemClass(TRAPS) {
 
   JavaValue result(T_VOID);
   JavaCalls::call_static(&result, klass, vmSymbols::initializeSystemClass_name(),
+                                         vmSymbols::void_method_signature(), CHECK);
+}
+
+static void call_initializeTenantContainerClass(TRAPS) {
+  Klass* k =  SystemDictionary::resolve_or_fail(vmSymbols::com_alibaba_tenant_TenantContainer(), true, CHECK);
+  instanceKlassHandle klass (THREAD, k);
+
+  JavaValue result(T_VOID);
+  JavaCalls::call_static(&result, klass, vmSymbols::initializeTenantContainerClass_name(),
+                                         vmSymbols::void_method_signature(), CHECK);
+}
+
+static void call_initializeJGroupClass(TRAPS) {
+  assert(TenantCpuThrottling || TenantCpuAccounting, "TenantCpuThrottling or TenantCpuAccounting disabled");
+  Klass* k =  SystemDictionary::resolve_or_fail(vmSymbols::com_alibaba_tenant_JGroup(), true, CHECK);
+  instanceKlassHandle klass (THREAD, k);
+
+  JavaValue result(T_VOID);
+  JavaCalls::call_static(&result, klass, vmSymbols::initializeJGroupClass_name(),
+                                         vmSymbols::void_method_signature(), CHECK);
+}
+
+static void call_initializeWispClass(TRAPS) {
+  Klass* k =  SystemDictionary::resolve_or_fail(vmSymbols::com_alibaba_wisp_engine_WispEngine(), true, CHECK);
+  instanceKlassHandle klass (THREAD, k);
+
+  JavaValue result(T_VOID);
+  JavaCalls::call_static(&result, klass, vmSymbols::initializeWispClass_name(),
+                                         vmSymbols::void_method_signature(), CHECK);
+}
+
+static void call_startWispDaemons(TRAPS) {
+  Klass* k =  SystemDictionary::resolve_or_fail(vmSymbols::com_alibaba_wisp_engine_WispEngine(), true, CHECK);
+  instanceKlassHandle klass (THREAD, k);
+
+  JavaValue result(T_VOID);
+  JavaCalls::call_static(&result, klass, vmSymbols::startWispDaemons_name(),
                                          vmSymbols::void_method_signature(), CHECK);
 }
 
@@ -1212,6 +1264,7 @@ NamedThread::NamedThread() : Thread() {
 }
 
 NamedThread::~NamedThread() {
+  JFR_ONLY(Jfr::on_thread_exit(this);)
   if (_name != NULL) {
     FREE_C_HEAP_ARRAY(char, _name, mtThread);
     _name = NULL;
@@ -1238,7 +1291,7 @@ WatcherThread* WatcherThread::_watcher_thread   = NULL;
 bool WatcherThread::_startable = false;
 volatile bool  WatcherThread::_should_terminate = false;
 
-WatcherThread::WatcherThread() : Thread(), _crash_protection(NULL) {
+WatcherThread::WatcherThread() : Thread() {
   assert(watcher_thread() == NULL, "we can only allocate one WatcherThread");
   if (os::create_thread(this, os::watcher_thread)) {
     _watcher_thread = this;
@@ -1433,9 +1486,11 @@ void JavaThread::initialize() {
   _anchor.clear();
   set_entry_point(NULL);
   set_jni_functions(jni_functions());
+  set_tenant_functions(tenant_functions());
   set_callee_target(NULL);
   set_vm_result(NULL);
   set_vm_result_2(NULL);
+  _vm_result_for_wisp = NULL;
   set_vframe_array_head(NULL);
   set_vframe_array_last(NULL);
   set_deferred_locals(NULL);
@@ -1462,6 +1517,11 @@ void JavaThread::initialize() {
   _interp_only_mode    = 0;
   _special_runtime_exit_condition = _no_async_condition;
   _pending_async_exception = NULL;
+
+  _coroutine_list = NULL;
+  _current_coroutine = NULL;
+  _wisp_preempted = false;
+
   _thread_stat = NULL;
   _thread_stat = new ThreadStatistics();
   _blocked_on_compilation = false;
@@ -1470,6 +1530,7 @@ void JavaThread::initialize() {
   _do_not_unlock_if_synchronized = false;
   _cached_monitor_info = NULL;
   _parker = Parker::Allocate(this) ;
+  _tenantObj = NULL;
 
 #ifndef PRODUCT
   _jmp_ring_index = 0;
@@ -1491,7 +1552,7 @@ void JavaThread::initialize() {
   // Setup safepoint state info for this thread
   ThreadSafepointState::create(this);
 
-  debug_only(_java_call_counter = 0);
+  _java_call_counter = 0;
 
   // JVMTI PopFrame support
   _popframe_condition = popframe_inactive;
@@ -1596,6 +1657,11 @@ JavaThread::JavaThread(ThreadFunction entry_point, size_t stack_sz) :
 }
 
 JavaThread::~JavaThread() {
+  while (EnableCoroutine && coroutine_list() != NULL) {
+     CoroutineStack::free_stack(coroutine_list()->stack(), this);
+     delete coroutine_list();
+  }
+
   if (TraceThreadEvents) {
       tty->print_cr("terminate thread %p", this);
   }
@@ -1645,6 +1711,9 @@ void JavaThread::run() {
   // Record real stack base and size.
   this->record_stack_base_and_size();
 
+  if (EnableCoroutine) {
+    this->initialize_coroutine_support();
+  }
   // Initialize thread local storage; set before calling MutexLocker
   this->initialize_thread_local_storage();
 
@@ -1669,11 +1738,7 @@ void JavaThread::run() {
     JvmtiExport::post_thread_start(this);
   }
 
-  EventThreadStart event;
-  if (event.should_commit()) {
-     event.set_javalangthread(java_lang_Thread::thread_id(this->threadObj()));
-     event.commit();
-  }
+  JFR_ONLY(Jfr::on_thread_start(this);)
 
   // We call another function to do the rest so we are sure that the stack addresses used
   // from there will be lower than the stack base just computed
@@ -1697,6 +1762,10 @@ void JavaThread::thread_main_inner() {
       this->set_native_thread_name(this->get_thread_name());
     }
     HandleMark hm(this);
+    if (EnableCoroutine && !is_Compiler_thread()) {
+      // compiler thread never calls back into java
+      Coroutine::initialize_coroutine_support(this);
+    }
     this->entry_point()(this, this);
   }
 
@@ -1800,17 +1869,7 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
         }
       }
     }
-
-    // Called before the java thread exit since we want to read info
-    // from java_lang_Thread object
-    EventThreadEnd event;
-    if (event.should_commit()) {
-        event.set_javalangthread(java_lang_Thread::thread_id(this->threadObj()));
-        event.commit();
-    }
-
-    // Call after last event on thread
-    EVENT_THREAD_EXIT(this);
+    JFR_ONLY(Jfr::on_java_thread_dismantle(this);)
 
     // Call Thread.exit(). We try 3 times in case we got another Thread.stop during
     // the execution of the method. If that is not enough, then we don't really care. Thread.stop
@@ -1884,9 +1943,32 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
     assert(!this->has_pending_exception(), "release_monitors should have cleared");
   }
 
+  if (EnableCoroutine &&
+      // SurrogateLockerThread, JvmtiAgentThread, ServiceThread, CompilerThread
+      // are extended from JavaThread, but their entries are not thread_entry hence
+      // coroutineSupport was not initialized. We should not call `destroyCoroutineSupport` here.
+      !is_Compiler_thread() &&
+      !is_hidden_from_external_view() &&
+      // SurrogateLockerThread and ServiceThread are "is_hidden_from_external_view()"
+      !is_jvmti_agent_thread()) {
+    assert(!UseWispMonitor || destroy_vm ||
+        java_lang_Thread::park_event(_threadObj), "park_event should been set");
+    EXCEPTION_MARK;
+    JavaValue result(T_VOID);
+    KlassHandle thread_klass(THREAD, SystemDictionary::Thread_klass());
+    JavaCalls::call_virtual(&result,
+                            threadObj, thread_klass,
+                            vmSymbols::destroyCoroutineSupport_method_name(),
+                            vmSymbols::void_method_signature(), THREAD);
+    assert(_current_coroutine == _coroutine_list, "not thread coroutine");
+    assert(_coroutine_list->next() == _coroutine_list, "ensure all coroutine has benn killed");
+    CLEAR_PENDING_EXCEPTION;
+  }
+
   // These things needs to be done while we are still a Java Thread. Make sure that thread
   // is in a consistent state, in case GC happens
   assert(_privileged_stack_top == NULL, "must be NULL when we get here");
+  JFR_ONLY(Jfr::on_thread_exit(this);)
 
   if (active_handles() != NULL) {
     JNIHandleBlock* block = active_handles();
@@ -1904,7 +1986,11 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
   remove_stack_guard_pages();
 
   if (UseTLAB) {
-    tlab().make_parsable(true);  // retire TLAB
+    if (UsePerTenantTLAB) {
+      make_all_tlabs_parsable(true, true);
+    } else {
+      tlab().make_parsable(true);  // retire TLAB
+    }
   }
 
   if (JvmtiEnv::environments_might_exist()) {
@@ -1930,12 +2016,212 @@ void JavaThread::exit(bool destroy_vm, ExitType exit_type) {
   Threads::remove(this);
 }
 
+// NOTE: active TLABs will only be retired & deleted at safepoint or thread ending.
+//       it is OK to destroy a G1TenantAllocationContext while its previously
+//       used TLABs are still linked in any mutator threads, because no further alloc requests
+//       can happen on this stale TLAB, its remaining free space cannot be
+//       used by any other threads or tenants either.
+
+#if INCLUDE_ALL_GCS
+void Thread::make_all_tlabs_parsable(bool retire, bool delete_saved) {
+  assert(UseG1GC && TenantHeapIsolation
+         && UseTLAB && UsePerTenantTLAB, "pre-condition");
+
+  for (ThreadLocalAllocBuffer* tlab = &(this->tlab()); tlab != NULL;
+       tlab = tlab->next()) {
+    tlab->make_parsable(retire);
+  }
+
+  if (delete_saved) {
+    assert(retire, "should only delete after retire!");
+    ThreadLocalAllocBuffer* tlab = this->tlab().next();
+    while (tlab != NULL) {
+      ThreadLocalAllocBuffer* next = tlab->next();
+      delete tlab;
+      tlab = next;
+    }
+
+    this->tlab().set_next(NULL);
+  }
+}
+
+void Thread::clean_tlab_for(const G1TenantAllocationContext* context) {
+  assert(UseG1GC && TenantHeapIsolation
+         && UseTLAB && UsePerTenantTLAB, "sanity");
+  assert(SafepointSynchronize::is_at_safepoint()
+         && Thread::current()->is_VM_thread(), "pre-condition");
+  guarantee(context != G1TenantAllocationContexts::system_context(),
+            "never clean root tenant context");
+
+  if (this->is_Java_thread()) {
+    JavaThread* java_thread = (JavaThread*)this;
+    // make sure TLAB's tenant allocation context is same as Java thread's
+    guarantee(java_thread->tenant_allocation_context() == this->tlab().tenant_allocation_context(),
+              err_msg("Inconsistent tenant allocation context thread=" PTR_FORMAT ",context=" PTR_FORMAT
+                      ", but its TLAB's context=" PTR_FORMAT,
+                      java_thread,
+                      java_thread->tenant_allocation_context(),
+                      this->tlab().tenant_allocation_context()));
+  }
+
+  // if the to-be-deleted context is current active context,
+  // we just completely switch to ROOT tenant's TLAB
+  const G1TenantAllocationContext* context_to_search =
+          this->tlab().tenant_allocation_context() == context ? G1TenantAllocationContexts::system_context() : context;
+
+  for (ThreadLocalAllocBuffer* tlab = &(this->tlab()), *prev = NULL;
+       tlab != NULL;
+       prev = tlab, tlab = tlab->next())
+  {
+    if (tlab->tenant_allocation_context() == context_to_search) {
+      guarantee(prev != NULL, "Cannot be an in-use TLAB");
+      if (context_to_search == G1TenantAllocationContexts::system_context()) {
+        guarantee(this->tlab().tenant_allocation_context() == context,
+                  "must be in-use TLAB");
+        guarantee(tlab != &(this->tlab()),
+                  "Cannot be root context");
+        this->tlab().make_parsable(true);
+        if (this->is_Java_thread()) {
+          // set_tenantObj will do search and swap, without changing the list structure
+          ((JavaThread*)this)->set_tenantObj(NULL);
+        } else {
+          this->tlab().swap_content(tlab);
+        }
+      } else {
+        guarantee(this->tlab().tenant_allocation_context() != context,
+                  "cannot be in-use TLAB");
+        tlab->make_parsable(true);
+      }
+      // remove the 'dead' TLAB from list
+      ThreadLocalAllocBuffer* next_tlab = tlab->next();
+      prev->set_next(next_tlab);
+      delete tlab;
+      return;
+    }
+  }
+}
+
+const AllocationContext_t& Thread::allocation_context() const {
+  assert(UseG1GC, "Only G1 policy supported");
+  return _alloc_context;
+}
+void Thread::set_allocation_context(AllocationContext_t context) {
+  assert(UseG1GC, "Only G1 policy supported");
+  assert(Thread::current() == this
+         || (SafepointSynchronize::is_at_safepoint() && Thread::current()->is_VM_thread()
+             && VMThread::vm_operation() != NULL
+             && VMThread::vm_operation()->type() == VM_Operation::VMOp_DestroyG1TenantAllocationContext),
+         "Only allowed to be set by self thread or tenant destruction vm_op");
+
+  _alloc_context = context;
+
+  if (UseG1GC && TenantHeapIsolation
+      && UseTLAB
+      && this->is_Java_thread()) { // only for Java thread, though _tlab is in Thread
+
+    if (UsePerTenantTLAB) {
+      G1TenantAllocationContext* tac = context.tenant_allocation_context();
+      ThreadLocalAllocBuffer* tlab = &(this->tlab());
+      assert(tlab != NULL, "Attach to same tenant twice!");
+
+      if (tlab->tenant_allocation_context() == tac) {
+        // no need to switch TLAB
+        assert(tac == G1TenantAllocationContexts::system_context(),
+               "Must be ROOT allocation context");
+        return;
+      }
+
+      // traverse saved TLAB list to search used TALBs for 'tac'
+      do {
+        tlab = tlab->next();
+        if (tlab != NULL && tlab->tenant_allocation_context() == tac) {
+          this->tlab().swap_content(tlab);
+          break;
+        }
+      } while (tlab != NULL);
+
+      // cannot find a saved TLAB, this is the first time current thread running into 'tac'
+      if (tlab == NULL) {
+        ThreadLocalAllocBuffer* new_tlab = new ThreadLocalAllocBuffer();
+        new_tlab->initialize();
+        // link to list
+        new_tlab->set_next(this->tlab().next());
+        new_tlab->set_tenant_allocation_context(tac);
+        this->tlab().set_next(new_tlab);
+        // make the new TLAB active
+        this->tlab().swap_content(new_tlab);
+      }
+    } else {
+      tlab().make_parsable(true /* retire */);
+    }
+  }
+}
+#endif // INCLUDE_ALL_GCS
+
 #if INCLUDE_ALL_GCS
 // Flush G1-related queues.
 void JavaThread::flush_barrier_queues() {
   satb_mark_queue().flush();
   dirty_card_queue().flush();
 }
+
+G1TenantAllocationContext* JavaThread::tenant_allocation_context() {
+  assert(TenantHeapIsolation, "pre-condition");
+
+  oop tenant_obj = tenantObj();
+  return (tenant_obj == NULL ? NULL : com_alibaba_tenant_TenantContainer::get_tenant_allocation_context(tenant_obj));
+}
+
+void JavaThread::set_tenant_allocation_context(G1TenantAllocationContext* context) {
+  assert(TenantHeapIsolation, "pre-condition");
+  set_tenantObj(context == NULL ? (oop)NULL : context->tenant_container());
+}
+
+void JavaThread::set_tenantObj(oop tenantObj) {
+  assert(MultiTenant
+         // prevent duplicate assigning values of non-ROOT tenant;
+         // but allow duplicated values of ROOT tenant, to support
+         // TenantContainer.destroy() while alive threads attached
+         && (_tenantObj != tenantObj || tenantObj == NULL),
+         "pre-condition");
+
+  if (_tenantObj == tenantObj) {
+    return;
+  }
+
+  oop prev_tenant = _tenantObj;
+  _tenantObj = tenantObj;
+
+#if INCLUDE_ALL_GCS
+  if (UseG1GC) {
+    set_allocation_context(AllocationContext_t(tenantObj == NULL ?
+                                               NULL : com_alibaba_tenant_TenantContainer::get_tenant_allocation_context(tenantObj)));
+
+#ifndef PRODUCT
+    if (TenantHeapIsolation && UseTLAB && UsePerTenantTLAB) {
+      G1TenantAllocationContext* prev_context = prev_tenant == NULL ? NULL /* root tenant */
+                                                                    : com_alibaba_tenant_TenantContainer::get_tenant_allocation_context(prev_tenant);
+      //
+      // thread was attached to tenant container whose allocation context is ROOT tenant's,
+      // which means the tenant container is DEAD.
+      //
+      // in current implementation, inconsistency between TenantContainer object
+      // and its G1TenantAllocationContext pointer is allowed.
+      // when a TenantContainer is destroyed before all attached threads get detached,
+      // JVM will just switch all the allocation contexts of attached threads to ROOT tenant,
+      // including the pointer recorded in TenantContainer object.
+      //
+      if (prev_tenant != NULL && prev_context == G1TenantAllocationContexts::system_context()) {
+        assert(com_alibaba_tenant_TenantContainer::is_dead(prev_tenant),
+               "Must be dead TenantContainer");
+      }
+    }
+#endif
+  }
+#endif // #if INCLUDE_ALL_GCS
+}
+
+
 
 void JavaThread::initialize_queues() {
   assert(!SafepointSynchronize::is_at_safepoint(),
@@ -1983,7 +2269,11 @@ void JavaThread::cleanup_failed_attach_current_thread() {
   remove_stack_guard_pages();
 
   if (UseTLAB) {
-    tlab().make_parsable(true);  // retire TLAB, if any
+    if (UsePerTenantTLAB) {
+      this->make_all_tlabs_parsable(true, false);
+    } else {
+      tlab().make_parsable(true);  // retire TLAB, if any
+    }
   }
 
 #if INCLUDE_ALL_GCS
@@ -2186,6 +2476,8 @@ void JavaThread::handle_special_runtime_exit_condition(bool check_asyncs) {
   if (check_asyncs) {
     check_and_handle_async_exceptions();
   }
+
+  JFR_ONLY(SUSPEND_THREAD_CONDITIONAL(this);)
 }
 
 void JavaThread::send_thread_stop(oop java_throwable)  {
@@ -2424,6 +2716,8 @@ void JavaThread::check_safepoint_and_suspend_for_native_trans(JavaThread *thread
       fatal("missed deoptimization!");
     }
   }
+
+  JFR_ONLY(SUSPEND_THREAD_CONDITIONAL(thread);)
 }
 
 // Slow path when the native==>VM/Java barriers detect a safepoint is in
@@ -2608,6 +2902,14 @@ void JavaThread::frames_do(void f(frame*, const RegisterMap* map)) {
     frame* fr = fst.current();
     f(fr, fst.register_map());
   }
+  if (EnableCoroutine) {
+    // traverse the coroutine stack frames
+    Coroutine* current = _coroutine_list;
+    do {
+      current->frames_do(f);
+      current = current->next();
+    } while (current != _coroutine_list);
+  }
 }
 
 
@@ -2771,6 +3073,15 @@ void JavaThread::oops_do(OopClosure* f, CLDClosure* cld_f, CodeBlobClosure* cf) 
     }
   }
 
+
+  if (EnableCoroutine) {
+    Coroutine* current = _coroutine_list;
+    do {
+      current->oops_do(f, cld_f, cf);
+      current = current->next();
+    } while (current != _coroutine_list);
+  }
+
   // callee_target is never live across a gc point so NULL it here should
   // it still contain a methdOop.
 
@@ -2789,7 +3100,9 @@ void JavaThread::oops_do(OopClosure* f, CLDClosure* cld_f, CodeBlobClosure* cf) 
   // Traverse instance variables at the end since the GC may be moving things
   // around using this function
   f->do_oop((oop*) &_threadObj);
+  f->do_oop((oop*) &_tenantObj);
   f->do_oop((oop*) &_vm_result);
+  f->do_oop((oop*) &_vm_result_for_wisp);
   f->do_oop((oop*) &_exception_oop);
   f->do_oop((oop*) &_pending_async_exception);
 
@@ -2810,6 +3123,14 @@ void JavaThread::nmethods_do(CodeBlobClosure* cf) {
       fst.current()->nmethods_do(cf);
     }
   }
+
+  if (EnableCoroutine) {
+    Coroutine* current = _coroutine_list;
+    do {
+      current->nmethods_do(cf);
+      current = current->next();
+    } while (current != _coroutine_list);
+  }
 }
 
 void JavaThread::metadata_do(void f(Metadata*)) {
@@ -2825,6 +3146,14 @@ void JavaThread::metadata_do(void f(Metadata*)) {
     if (ct->env() != NULL) {
       ct->env()->metadata_do(f);
     }
+  }
+
+  if (EnableCoroutine) {
+    Coroutine* current = _coroutine_list;
+    do {
+      current->metadata_do(f);
+      current = current->next();
+    } while (current != _coroutine_list);
   }
 }
 
@@ -3312,6 +3641,14 @@ void Threads::threads_do(ThreadClosure* tc) {
   if (wt != NULL)
     tc->do_thread(wt);
 
+#if INCLUDE_JFR
+  Thread* sampler_thread = Jfr::sampler_thread();
+  if (sampler_thread != NULL) {
+    tc->do_thread(sampler_thread);
+  }
+
+#endif
+
   // If CompilerThreads ever become non-JavaThreads, add them here
 }
 
@@ -3411,6 +3748,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // stacksize. This adjusted size is what is used to figure the placement
   // of the guard pages.
   main_thread->record_stack_base_and_size();
+  if (EnableCoroutine) {
+    main_thread->initialize_coroutine_support();
+  }
   main_thread->initialize_thread_local_storage();
 
   main_thread->set_active_handles(JNIHandleBlock::allocate_block());
@@ -3437,6 +3777,8 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     *canTryAgain = false; // don't let caller call JNI_CreateJavaVM again
     return status;
   }
+
+  JFR_ONLY(Jfr::on_create_vm_1();)
 
   // Should be done after the heap is fully created
   main_thread->cache_global_variables();
@@ -3487,12 +3829,16 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     ShouldNotReachHere();
   }
 
+#if !INCLUDE_JFR
+  // if JFR is not enabled at the build time keep the original JvmtiExport location
+
   // Always call even when there are not JVMTI environments yet, since environments
   // may be attached late and JVMTI must track phases of VM execution
   JvmtiExport::enter_start_phase();
 
   // Notify JVMTI agents that VM has started (JNI is up) - nop if no agents.
   JvmtiExport::post_vm_start();
+#endif
 
   {
     TraceTime timer("Initialize java.lang classes", TraceStartupTime);
@@ -3524,6 +3870,12 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     initialize_class(vmSymbols::java_lang_ref_Finalizer(),  CHECK_0);
     call_initializeSystemClass(CHECK_0);
 
+    if (EnableCoroutine) {
+      initialize_class(vmSymbols::java_dyn_CoroutineSupport(), CHECK_0);
+      Coroutine::initialize_coroutine_support((JavaThread*) THREAD);
+      call_initializeWispClass(CHECK_0);
+    }
+
     // get the Java runtime name after java.lang.System is initialized
     JDK_Version::set_runtime_name(get_java_runtime_name(THREAD));
     JDK_Version::set_runtime_version(get_java_runtime_version(THREAD));
@@ -3538,6 +3890,25 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
     initialize_class(vmSymbols::java_lang_IllegalMonitorStateException(), CHECK_0);
     initialize_class(vmSymbols::java_lang_IllegalArgumentException(), CHECK_0);
   }
+
+  // Multi-tenant support
+  if (MultiTenant) {
+    //Initialize TennatContainer class after the system is booted.
+    call_initializeTenantContainerClass(CHECK_0);
+  }
+
+  JFR_ONLY(
+    Jfr::on_create_vm_2();
+
+    // if JFR is enabled at build time the JVMTI needs to be handled only after on_create_vm_2() call
+
+    // Always call even when there are not JVMTI environments yet, since environments
+    // may be attached late and JVMTI must track phases of VM execution
+    JvmtiExport::enter_start_phase();
+
+    // Notify JVMTI agents that VM has started (JNI is up) - nop if no agents.
+    JvmtiExport::post_vm_start();
+  )
 
   // See        : bugid 4211085.
   // Background : the static initializer of java.lang.Compiler tries to read
@@ -3565,16 +3936,18 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
 
   quicken_jni_functions();
 
-  // Must be run after init_ft which initializes ft_enabled
-  if (TRACE_INITIALIZE() != JNI_OK) {
-    vm_exit_during_initialization("Failed to initialize tracing backend");
-  }
-
   // Set flag that basic initialization has completed. Used by exceptions and various
   // debug stuff, that does not work until all basic classes have been initialized.
   set_init_completed();
 
   Metaspace::post_initialize();
+
+  if (EnableCoroutine) {
+    call_startWispDaemons(THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      vm_exit_during_initialization(Handle(THREAD, PENDING_EXCEPTION));
+    }
+  }
 
 #ifndef USDT2
   HS_DTRACE_PROBE(hotspot, vm__init__end);
@@ -3611,6 +3984,12 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
       vm_exit_during_initialization(Handle(THREAD, PENDING_EXCEPTION));
     }
   }
+  if (G1ElasticHeap) {
+    ElasticHeapTimer::start();
+    if (HAS_PENDING_EXCEPTION) {
+      vm_exit_during_initialization(Handle(THREAD, PENDING_EXCEPTION));
+    }
+  }
 #endif // INCLUDE_ALL_GCS
 
   // Always call even when there are not JVMTI environments yet, since environments
@@ -3638,9 +4017,7 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // Notify JVMTI agents that VM initialization is complete - nop if no agents.
   JvmtiExport::post_vm_initialized();
 
-  if (TRACE_START() != JNI_OK) {
-    vm_exit_during_initialization("Failed to start tracing backend.");
-  }
+  JFR_ONLY(Jfr::on_create_vm_3();)
 
   if (CleanChunkPoolAsync) {
     Chunk::start_chunk_pool_cleaner_task();
@@ -3679,6 +4056,12 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
 
   BiasedLocking::init();
 
+  if (CompilationWarmUp) {
+    JitWarmUp* jwp = JitWarmUp::instance();
+    assert(jwp != NULL, "sanity check");
+    jwp->preloader()->jvm_booted_is_done();
+  }
+
 #if INCLUDE_RTM_OPT
   RTMLockingCounters::init();
 #endif
@@ -3705,6 +4088,14 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
           WatcherThread::start();
       }
   }
+
+#if (defined(LINUX) && defined(AMD64))
+  if (MultiTenant && (TenantCpuThrottling || TenantCpuAccounting)) {
+    // JGroup initialization may involve complex steps
+    // have to do that after full JVM initialization
+    call_initializeJGroupClass(CHECK_0);
+  }
+#endif
 
   create_vm_timer.end();
 #ifdef ASSERT
@@ -3908,6 +4299,20 @@ JavaThread* Threads::find_java_thread_from_java_tid(jlong java_tid) {
       java_thread = thread;
       break;
     }
+
+    if (EnableCoroutine) {
+      for (Coroutine* co = thread->coroutine_list()->next();
+          co != thread->coroutine_list(); co = co->next()) {
+        oop wtObj = com_alibaba_wisp_engine_WispTask::get_threadWrapper(co->wisp_task());
+        // wtObj == 0 means coroutine is cached
+        if (!thread->is_exiting() &&
+            wtObj != NULL &&
+            java_tid == java_lang_Thread::thread_id(wtObj)) {
+          co->wisp_thread()->set_threadObj(wtObj);
+          return co->wisp_thread();
+        }
+      }
+    }
   }
   return java_thread;
 }
@@ -4000,6 +4405,12 @@ bool Threads::destroy_vm() {
       //
       Threads_lock->wait(!Mutex::_no_safepoint_check_flag, 0,
                          Mutex::_as_suspend_equivalent_flag);
+  }
+
+  EventShutdown e;
+  if (e.should_commit()) {
+    e.set_reason("No remaining non-daemon Java threads");
+    e.commit();
   }
 
   // Hang forever on exit if we are reporting an error.
@@ -4292,7 +4703,19 @@ JavaThread *Threads::owning_thread_from_monitor_owner(address owner, bool doLock
     MutexLockerEx ml(doLock ? Threads_lock : NULL);
     ALL_JAVA_THREADS(p) {
       // first, see if owner is the address of a Java thread
-      if (owner == (address)p) return p;
+      if (UseWispMonitor) {
+        if (p->coroutine_list()) {
+          Coroutine* c = p->coroutine_list();
+          do {
+            if ((address) c->wisp_thread() == owner) {
+              return c->wisp_thread();
+            }
+            c = c->next();
+          } while (c != p->coroutine_list());
+        }
+      } else if (owner == (address)p) {
+        return p;
+      }
     }
   }
   // Cannot assert on lack of success here since this function may be
@@ -4309,7 +4732,18 @@ JavaThread *Threads::owning_thread_from_monitor_owner(address owner, bool doLock
   {
     MutexLockerEx ml(doLock ? Threads_lock : NULL);
     ALL_JAVA_THREADS(q) {
-      if (q->is_lock_owned(owner)) {
+      if (UseWispMonitor) {
+        if (q->coroutine_list()) {
+          Coroutine* c = q->coroutine_list();
+          do {
+            if (c->wisp_thread()->is_lock_owned(owner)) {
+              the_owner = c->wisp_thread();
+              break;
+            }
+            c = c->next();
+          } while (c != q->coroutine_list());
+        }
+      } else if (q->is_lock_owned(owner)) {
         the_owner = q;
         break;
       }
@@ -4347,6 +4781,18 @@ void Threads::print_on(outputStream* st, bool print_stacks, bool internal_format
         p->trace_stack();
       } else {
         p->print_stack_on(st);
+        if (EnableCoroutine) {
+          assert(p->coroutine_list() != NULL, "coroutine list");
+          if (!p->is_Compiler_thread() && (PrintThreadCoroutineInfo || !p->current_coroutine()->is_thread_coroutine())) {
+            p->current_coroutine()->print_stack_header_on(st);
+            st->print("\n");
+          }
+          Coroutine* c = p->coroutine_list();
+          do {
+            c->print_stack_on(st);
+            c = c->next();
+          } while (c != p->coroutine_list());
+        }
       }
     }
     st->cr();
@@ -4366,6 +4812,11 @@ void Threads::print_on(outputStream* st, bool print_stacks, bool internal_format
     st->cr();
   }
   CompileBroker::print_compiler_threads_on(st);
+
+  if (CompilationWarmUpRecording) {
+    JitWarmUpFlushThread::print_jwarmup_threads_on(st);
+    st->cr();
+  }
   st->flush();
 }
 
@@ -4682,11 +5133,14 @@ void Thread::muxRelease (volatile intptr_t * Lock)  {
   }
 }
 
-
 void Threads::verify() {
   ALL_JAVA_THREADS(p) {
     p->verify();
   }
   VMThread* thread = VMThread::vm_thread();
   if (thread != NULL) thread->verify();
+}
+
+void JavaThread::initialize_coroutine_support() {
+  Coroutine::create_thread_coroutine(this, CoroutineStack::create_thread_stack(this))->insert_into_list(_coroutine_list);
 }

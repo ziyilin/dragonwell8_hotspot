@@ -25,7 +25,6 @@
 #ifndef SHARE_VM_GC_INTERFACE_COLLECTEDHEAP_INLINE_HPP
 #define SHARE_VM_GC_INTERFACE_COLLECTEDHEAP_INLINE_HPP
 
-#include "gc_interface/allocTracer.hpp"
 #include "gc_interface/collectedHeap.hpp"
 #include "memory/threadLocalAllocBuffer.inline.hpp"
 #include "memory/universe.hpp"
@@ -69,7 +68,7 @@ void CollectedHeap::post_allocation_install_obj_klass(KlassHandle klass,
          "missing klass");
 }
 
-// Support for jvmti and dtrace
+// Support for jvmti, jfr and dtrace
 inline void post_allocation_notify(KlassHandle klass, oop obj, int size) {
   // support low memory notifications (no-op if not enabled)
   LowMemoryDetector::detect_low_memory_for_collected_pools();
@@ -83,6 +82,9 @@ inline void post_allocation_notify(KlassHandle klass, oop obj, int size) {
       SharedRuntime::dtrace_object_alloc(obj, size);
     }
   }
+
+  // support for jfr
+  CollectedHeap::trace_slow_allocation(klass, obj, size * HeapWordSize, Thread::current());
 }
 
 void CollectedHeap::post_allocation_setup_obj(KlassHandle klass,
@@ -91,7 +93,7 @@ void CollectedHeap::post_allocation_setup_obj(KlassHandle klass,
   post_allocation_setup_common(klass, obj);
   assert(Universe::is_bootstrapping() ||
          !((oop)obj)->is_array(), "must not be an array");
-  // notify jvmti and dtrace
+  // notify jvmti, jfr and dtrace
   post_allocation_notify(klass, (oop)obj, size);
 }
 
@@ -106,7 +108,7 @@ void CollectedHeap::post_allocation_setup_array(KlassHandle klass,
   post_allocation_setup_common(klass, obj);
   oop new_obj = (oop)obj;
   assert(new_obj->is_array(), "must be an array");
-  // notify jvmti and dtrace (must be after length is set for dtrace)
+  // notify jvmti, jfr and dtrace (must be after length is set for dtrace)
   post_allocation_notify(klass, new_obj, new_obj->size());
 }
 
@@ -140,7 +142,7 @@ HeapWord* CollectedHeap::common_mem_allocate_noinit(KlassHandle klass, size_t si
            "Unexpected exception, will result in uninitialized storage");
     THREAD->incr_allocated_bytes(size * HeapWordSize);
 
-    AllocTracer::send_allocation_outside_tlab_event(klass, size * HeapWordSize);
+    CollectedHeap::trace_allocation_outside_tlab(klass, result, size * HeapWordSize, THREAD);
 
     return result;
   }
@@ -206,6 +208,30 @@ oop CollectedHeap::obj_allocate(KlassHandle klass, int size, TRAPS) {
   return (oop)obj;
 }
 
+void CollectedHeap::check_array_size(int size,
+                                     int length,
+                                     TRAPS) {
+  if (size >= ArrayAllocationWarningSize >> LogHeapWordSize) {
+    //JavaThread::name() may need allocation
+    ResourceMark rm(THREAD);
+    //give a warning
+    tty->print_cr("==WARNING==  allocating large array--"            \
+                           "thread_id[" INTPTR_FORMAT "]--"          \
+                           "thread_name[%s]--"                       \
+                           "array_size[" SIZE_FORMAT " bytes]--"     \
+                           "array_length[%d elememts]",
+                           p2i(THREAD), THREAD->name(),
+                           (size_t)size * HeapWordSize, length);
+
+    //print stack info
+    THREAD->print_on(tty);
+    tty->cr();
+    if (THREAD->is_Java_thread()) {
+      ((JavaThread*) THREAD)->print_stack_on(tty);
+    }
+  }
+}
+
 oop CollectedHeap::array_allocate(KlassHandle klass,
                                   int size,
                                   int length,
@@ -213,6 +239,7 @@ oop CollectedHeap::array_allocate(KlassHandle klass,
   debug_only(check_for_valid_allocation_state());
   assert(!Universe::heap()->is_gc_active(), "Allocation during gc not allowed");
   assert(size >= 0, "int won't convert to size_t");
+  check_array_size(size, length, THREAD);
   HeapWord* obj = common_mem_allocate_init(klass, size, CHECK_NULL);
   post_allocation_setup_array(klass, obj, length);
   NOT_PRODUCT(Universe::heap()->check_for_bad_heap_word_value(obj, size));
@@ -226,6 +253,7 @@ oop CollectedHeap::array_allocate_nozero(KlassHandle klass,
   debug_only(check_for_valid_allocation_state());
   assert(!Universe::heap()->is_gc_active(), "Allocation during gc not allowed");
   assert(size >= 0, "int won't convert to size_t");
+  check_array_size(size, length, THREAD);
   HeapWord* obj = common_mem_allocate_noinit(klass, size, CHECK_NULL);
   ((oop)obj)->set_klass_gap(0);
   post_allocation_setup_array(klass, obj, length);

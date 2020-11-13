@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2014, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@
 #define SHARE_VM_GC_IMPLEMENTATION_G1_G1GCPHASETIMESLOG_HPP
 
 #include "memory/allocation.hpp"
+#include "gc_implementation/shared/workerDataArray.hpp"
 
 class LineBuffer;
 
@@ -42,6 +43,7 @@ class G1GCPhaseTimes : public CHeapObj<mtGC> {
     GCWorkerStart,
     ExtRootScan,
     ThreadRoots,
+    TenantAllocationContextRoots,
     StringTableRoots,
     UniverseRoots,
     JNIRoots,
@@ -278,7 +280,7 @@ class G1GCPhaseTimes : public CHeapObj<mtGC> {
 };
 
 class G1GCParPhaseTimesTracker : public StackObj {
-  double _start_time;
+  Ticks _start_time;
   G1GCPhaseTimes::GCParPhases _phase;
   G1GCPhaseTimes* _phase_times;
   uint _worker_id;

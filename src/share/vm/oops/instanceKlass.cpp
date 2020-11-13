@@ -34,6 +34,7 @@
 #include "interpreter/oopMapCache.hpp"
 #include "interpreter/rewriter.hpp"
 #include "jvmtifiles/jvmti.h"
+#include "jwarmup/jitWarmUp.hpp"
 #include "memory/genOopClosures.inline.hpp"
 #include "memory/heapInspection.hpp"
 #include "memory/iterator.inline.hpp"
@@ -53,6 +54,7 @@
 #include "prims/jvmtiRedefineClasses.hpp"
 #include "prims/jvmtiThreadState.hpp"
 #include "prims/methodComparator.hpp"
+#include "runtime/coroutine.hpp"
 #include "runtime/fieldDescriptor.hpp"
 #include "runtime/handles.inline.hpp"
 #include "runtime/javaCalls.hpp"
@@ -78,6 +80,10 @@
 #ifdef COMPILER1
 #include "c1/c1_Compiler.hpp"
 #endif
+#if INCLUDE_JFR
+#include "jfr/jfrEvents.hpp"
+#endif
+
 
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
 
@@ -323,6 +329,14 @@ InstanceKlass::InstanceKlass(int vtable_len,
   // Set temporary value until parseClassFile updates it with the real instance
   // size.
   set_layout_helper(Klass::instance_layout_helper(0, true));
+
+  set_jwarmup_recorded(false);
+#ifndef PRODUCT
+  set_initialize_order(-1);
+#endif
+  set_crc32(0);
+  set_bytes_size(0);
+  set_source_file_path(NULL);
 }
 
 
@@ -376,6 +390,13 @@ void InstanceKlass::deallocate_contents(ClassLoaderData* loader_data) {
 
   // Need to take this class off the class loader data list.
   loader_data->remove_class(this);
+
+  if (CompilationWarmUp || CompilationWarmUpRecording) {
+    if (source_file_path() != NULL) {
+      source_file_path()->decrement_refcount();
+      set_source_file_path(NULL);
+    }
+  }
 
   // The array_klass for this class is created later, after error handling.
   // For class redefinition, we keep the original class so this scratch class
@@ -885,6 +906,9 @@ void InstanceKlass::initialize_impl(instanceKlassHandle this_oop, TRAPS) {
     this_oop->set_init_state(being_initialized);
     this_oop->set_init_thread(self);
   }
+  if (CompilationWarmUpRecording) {
+    JitWarmUp::instance()->recorder()->assign_class_init_order(this_oop());
+  }
 
   // Step 7
   // Next, if C is a class rather than an interface, initialize its super class and super
@@ -1206,6 +1230,7 @@ Klass* InstanceKlass::array_klass_impl(bool or_null, TRAPS) {
 }
 
 void InstanceKlass::call_class_initializer(TRAPS) {
+  WispClinitCounterMark wcm(THREAD);
   instanceKlassHandle ik (THREAD, this);
   call_class_initializer_impl(ik, THREAD);
 }
@@ -2529,6 +2554,14 @@ void InstanceKlass::notify_unload_class(InstanceKlass* ik) {
 
   // notify ClassLoadingService of class unload
   ClassLoadingService::notify_class_unloaded(ik);
+
+#if INCLUDE_JFR
+  assert(ik != NULL, "invariant");
+  EventClassUnload event;
+  event.set_unloadedClass(ik);
+  event.set_definingClassLoader(ik->class_loader_data());
+  event.commit();
+#endif
 }
 
 void InstanceKlass::release_C_heap_structures(InstanceKlass* ik) {
@@ -3901,4 +3934,21 @@ jint InstanceKlass::get_cached_class_file_len() {
 
 unsigned char * InstanceKlass::get_cached_class_file_bytes() {
   return VM_RedefineClasses::get_cached_class_file_bytes(_cached_class_file);
+}
+
+bool InstanceKlass::is_reentrant_initialization(Thread *thread)  {
+  if (UseWispMonitor) {
+    assert(thread != NULL, "sanity check");
+    thread = WispThread::current(thread);
+  }
+  return thread == _init_thread;
+}
+
+void InstanceKlass::set_init_thread(Thread *thread)  {
+  if (UseWispMonitor && thread != NULL) {
+    assert(thread->is_Java_thread(), "sanity check");
+    assert(((JavaThread*) thread)->current_coroutine() != NULL, "sanity check");
+    thread = WispThread::current(thread);
+  }
+  _init_thread = thread;
 }

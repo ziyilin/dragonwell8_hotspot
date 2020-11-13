@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -245,6 +245,7 @@ class HeapDumpDCmd : public DCmdWithParser {
 protected:
   DCmdArgument<char*> _filename;
   DCmdArgument<bool>  _all;
+  DCmdArgument<bool>  _mini_dump;
 public:
   HeapDumpDCmd(outputStream* output, bool heap);
   static const char* name() {
@@ -439,6 +440,44 @@ public:
                         "control", NULL};
     return p;
   }
+};
+
+class JWarmupDCmd : public DCmdWithParser {
+protected:
+  DCmdArgument<bool> _notify_startup;
+  DCmdArgument<bool> _check_compile_finished;
+  DCmdArgument<bool> _deopt;
+  DCmdArgument<bool> _help;
+  void print_info();
+public:
+  JWarmupDCmd(outputStream* output, bool heap_allocated);
+  static const char* name() {
+    return "JWarmup";
+  }
+  static const char* description() {
+    return "JWarmup command. ";
+  }
+  static int num_arguments();
+  virtual void execute(DCmdSource source, TRAPS);
+};
+
+class ElasticHeapDCmd : public DCmdWithParser {
+protected:
+  DCmdArgument<jlong> _young_commit_percent;
+  DCmdArgument<jlong> _uncommit_ihop;
+  DCmdArgument<jlong> _softmx_percent;
+  void print_info();
+  bool illegal_percent(uint percent, const char* name);
+public:
+  ElasticHeapDCmd(outputStream* output, bool heap_allocated);
+  static const char* name() {
+    return "GC.elastic_heap";
+  }
+  static const char* description() {
+    return "Elastic Heap Command";
+  }
+  static int num_arguments();
+  virtual void execute(DCmdSource source, TRAPS);
 };
 
 #endif // SHARE_VM_SERVICES_DIAGNOSTICCOMMAND_HPP

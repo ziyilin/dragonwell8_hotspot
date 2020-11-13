@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001, 2014, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@
 #define SHARE_VM_GC_INTERFACE_COLLECTEDHEAP_HPP
 
 #include "gc_interface/gcCause.hpp"
+#include "gc_interface/allocTracer.hpp"
 #include "gc_implementation/shared/gcWhen.hpp"
 #include "memory/allocation.hpp"
 #include "memory/barrierSet.hpp"
@@ -319,6 +320,18 @@ class CollectedHeap : public CHeapObj<mtInternal> {
   inline static oop obj_allocate(KlassHandle klass, int size, TRAPS);
   inline static oop array_allocate(KlassHandle klass, int size, int length, TRAPS);
   inline static oop array_allocate_nozero(KlassHandle klass, int size, int length, TRAPS);
+ private:
+  inline static void check_array_size(int size, int length, TRAPS);
+
+ public:
+  // Implicit Jfr inline methods.
+  static void trace_slow_allocation(KlassHandle klass, oop obj, size_t alloc_size, Thread* thread) {
+    AllocTracer::send_slow_allocation_event(klass, obj, alloc_size, thread);
+  }
+
+  static void trace_allocation_outside_tlab(KlassHandle klass, HeapWord* obj, size_t alloc_size, Thread* thread) {
+    AllocTracer::send_allocation_outside_tlab_event(klass, obj, alloc_size, thread);
+  }
 
   inline static void post_allocation_install_obj_klass(KlassHandle klass,
                                                        oop obj);

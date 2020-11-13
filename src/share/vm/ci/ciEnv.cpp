@@ -40,6 +40,7 @@
 #include "compiler/compilerOracle.hpp"
 #include "gc_interface/collectedHeap.inline.hpp"
 #include "interpreter/linkResolver.hpp"
+#include "jfr/jfrEvents.hpp"
 #include "memory/allocation.inline.hpp"
 #include "memory/oopFactory.hpp"
 #include "memory/universe.inline.hpp"
@@ -138,6 +139,11 @@ ciEnv::ciEnv(CompileTask* task, int system_dictionary_modification_counter)
   _ClassCastException_instance = NULL;
   _the_null_string = NULL;
   _the_min_jint_string = NULL;
+
+  _jvmti_can_hotswap_or_post_breakpoint = false;
+  _jvmti_can_access_local_variables = false;
+  _jvmti_can_post_on_exceptions = false;
+  _jvmti_can_pop_frame = false;
 }
 
 ciEnv::ciEnv(Arena* arena) : _ciEnv_arena(mtCompiler) {
@@ -188,6 +194,11 @@ ciEnv::ciEnv(Arena* arena) : _ciEnv_arena(mtCompiler) {
   _ClassCastException_instance = NULL;
   _the_null_string = NULL;
   _the_min_jint_string = NULL;
+
+  _jvmti_can_hotswap_or_post_breakpoint = false;
+  _jvmti_can_access_local_variables = false;
+  _jvmti_can_post_on_exceptions = false;
+  _jvmti_can_pop_frame = false;
 }
 
 ciEnv::~ciEnv() {
@@ -207,6 +218,31 @@ void ciEnv::cache_jvmti_state() {
   _jvmti_can_hotswap_or_post_breakpoint = JvmtiExport::can_hotswap_or_post_breakpoint();
   _jvmti_can_access_local_variables     = JvmtiExport::can_access_local_variables();
   _jvmti_can_post_on_exceptions         = JvmtiExport::can_post_on_exceptions();
+  _jvmti_can_pop_frame                  = JvmtiExport::can_pop_frame();
+}
+
+bool ciEnv::should_retain_local_variables() const {
+  return _jvmti_can_access_local_variables || _jvmti_can_pop_frame;
+}
+
+bool ciEnv::jvmti_state_changed() const {
+  if (!_jvmti_can_access_local_variables &&
+      JvmtiExport::can_access_local_variables()) {
+    return true;
+  }
+  if (!_jvmti_can_hotswap_or_post_breakpoint &&
+      JvmtiExport::can_hotswap_or_post_breakpoint()) {
+    return true;
+  }
+  if (!_jvmti_can_post_on_exceptions &&
+      JvmtiExport::can_post_on_exceptions()) {
+    return true;
+  }
+  if (!_jvmti_can_pop_frame &&
+      JvmtiExport::can_pop_frame()) {
+    return true;
+  }
+  return false;
 }
 
 // ------------------------------------------------------------------
@@ -673,6 +709,63 @@ ciField* ciEnv::get_field_by_index(ciInstanceKlass* accessor,
 }
 
 // ------------------------------------------------------------------
+// ciEnv::check_field_resolved
+//
+// Check whether this field has been resolved.
+bool ciEnv::check_field_resolved(ciInstanceKlass* accessor,
+                                 int index) {
+  GUARDED_VM_ENTRY(
+  ciConstantPoolCache* cache = accessor->field_cache();
+  if (cache != NULL) {
+    ciField* field = (ciField*)cache->get(index);
+    if (field != NULL) {
+      return true;
+    }
+  }
+  CompilerThread *thread = CompilerThread::current();
+  assert(accessor->get_instanceKlass()->is_linked(), "must be linked before using its constant-pool");
+  constantPoolHandle cpool(thread, accessor->get_instanceKlass()->constants());
+
+  // Get the field's name, signature, and type.
+  Symbol* name  = cpool->name_ref_at(index);
+  if (name == NULL) {
+    return false;
+  }
+  int name_index = cpool->name_and_type_ref_index_at(index);
+  int sig_index = cpool->signature_ref_index_at(name_index);
+  Symbol* signature = cpool->symbol_at(sig_index);
+  if (signature == NULL) {
+    return false;
+  }
+    return true;
+  )
+}
+
+// ------------------------------------------------------------------
+//
+// Check if all fields needed by this method in ConstantPool are resolved
+bool ciEnv::check_method_fields_all_resolved(ciMethod* method) {
+  ciInstanceKlass* klass = method->holder();
+  ciBytecodeStream str(method);
+  int start = 0;
+  int limit = method->code_size();
+  str.reset_to_bci(start);
+  Bytecodes::Code code;
+  while ((code = str.next()) != ciBytecodeStream::EOBC() &&
+         str.cur_bci() < limit) {
+    if (code == Bytecodes::_getfield   ||
+        code == Bytecodes::_getstatic  ||
+        code == Bytecodes::_putfield   ||
+        code == Bytecodes::_putstatic) {
+      if (!check_field_resolved(klass, str.get_index_u2_cpcache())) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------
 // ciEnv::lookup_method
 //
 // Perform an appropriate method lookup based on accessor, holder,
@@ -952,13 +1045,7 @@ void ciEnv::register_method(ciMethod* target,
     No_Safepoint_Verifier nsv;
 
     // Change in Jvmti state may invalidate compilation.
-    if (!failing() &&
-        ( (!jvmti_can_hotswap_or_post_breakpoint() &&
-           JvmtiExport::can_hotswap_or_post_breakpoint()) ||
-          (!jvmti_can_access_local_variables() &&
-           JvmtiExport::can_access_local_variables()) ||
-          (!jvmti_can_post_on_exceptions() &&
-           JvmtiExport::can_post_on_exceptions()) )) {
+    if (!failing() && jvmti_state_changed()) {
       record_failure("Jvmti state change invalidated dependencies");
     }
 

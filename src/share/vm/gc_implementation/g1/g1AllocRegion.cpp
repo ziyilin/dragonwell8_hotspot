@@ -178,8 +178,8 @@ void G1AllocRegion::update_alloc_region(HeapRegion* alloc_region) {
   assert(alloc_region != NULL && !alloc_region->is_empty(),
          ar_ext_msg(this, "pre-condition"));
 
+  alloc_region->set_allocation_context(allocation_context());
   _alloc_region = alloc_region;
-  _alloc_region->set_allocation_context(allocation_context());
   _count += 1;
   trace("updated");
 }
@@ -243,11 +243,22 @@ G1AllocRegion::G1AllocRegion(const char* name,
 
 HeapRegion* MutatorAllocRegion::allocate_new_region(size_t word_size,
                                                     bool force) {
+  // if it is about to exceed tenant heap limit, fail current request directly
+  if (TenantHeapThrottling && !allocation_context().is_system()
+      && !allocation_context()->can_allocate(word_size)) {
+    return NULL;
+  }
+
   return _g1h->new_mutator_alloc_region(word_size, force);
 }
 
 void MutatorAllocRegion::retire_region(HeapRegion* alloc_region,
                                        size_t allocated_bytes) {
+  DEBUG_ONLY(if (TenantHeapIsolation) {
+    assert(alloc_region->allocation_context() == allocation_context(),
+           "Inconsistent allocation contexts");
+  });
+
   _g1h->retire_mutator_alloc_region(alloc_region, allocated_bytes);
 }
 
@@ -259,6 +270,11 @@ HeapRegion* SurvivorGCAllocRegion::allocate_new_region(size_t word_size,
 
 void SurvivorGCAllocRegion::retire_region(HeapRegion* alloc_region,
                                           size_t allocated_bytes) {
+  DEBUG_ONLY(if (TenantHeapIsolation) {
+    assert(alloc_region->allocation_context() == allocation_context(),
+           "HeapRegion's context should be same as SurvivorGCAllocRegion's");
+  });
+
   _g1h->retire_gc_alloc_region(alloc_region, allocated_bytes, InCSetState::Young);
 }
 
@@ -270,6 +286,11 @@ HeapRegion* OldGCAllocRegion::allocate_new_region(size_t word_size,
 
 void OldGCAllocRegion::retire_region(HeapRegion* alloc_region,
                                      size_t allocated_bytes) {
+  DEBUG_ONLY(if (TenantHeapIsolation) {
+    assert(alloc_region->allocation_context() == allocation_context(),
+           "HeapRegion's context should be same as OldGCAllocRegion's");
+  });
+
   _g1h->retire_gc_alloc_region(alloc_region, allocated_bytes, InCSetState::Old);
 }
 

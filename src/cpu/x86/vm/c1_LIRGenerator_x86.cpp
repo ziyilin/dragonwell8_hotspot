@@ -233,8 +233,8 @@ void LIRGenerator::cmp_reg_mem(LIR_Condition condition, LIR_Opr reg, LIR_Opr bas
 }
 
 
-bool LIRGenerator::strength_reduce_multiply(LIR_Opr left, int c, LIR_Opr result, LIR_Opr tmp) {
-  if (tmp->is_valid()) {
+bool LIRGenerator::strength_reduce_multiply(LIR_Opr left, jint c, LIR_Opr result, LIR_Opr tmp) {
+  if (tmp->is_valid() && c > 0 && c < max_jint) {
     if (is_power_of_2(c + 1)) {
       __ move(left, tmp);
       __ shift_left(left, log2_jint(c + 1), left);
@@ -373,7 +373,16 @@ void LIRGenerator::do_MonitorExit(MonitorExit* x) {
   LIR_Opr lock = new_register(T_INT);
   LIR_Opr obj_temp = new_register(T_INT);
   set_no_result(x);
-  monitor_exit(obj_temp, lock, syncTempOpr(), LIR_OprFact::illegalOpr, x->monitor_no());
+  // Info is used to genereate oopmap, which is necessary for calling java code during rutime.
+  if (UseWispMonitor) {
+    CodeEmitInfo* info = NULL;
+    if (x->state()) {
+      info = state_for(x, x->state(), true);
+    }
+    monitor_exit(obj_temp, lock, syncTempOpr(), LIR_OprFact::illegalOpr, x->monitor_no(), NULL, info);
+  } else {
+    monitor_exit(obj_temp, lock, syncTempOpr(), LIR_OprFact::illegalOpr, x->monitor_no());
+  }
 }
 
 
@@ -602,8 +611,8 @@ void LIRGenerator::do_ArithmeticOp_Int(ArithmeticOp* x) {
       bool use_constant = false;
       bool use_tmp = false;
       if (right_arg->is_constant()) {
-        int iconst = right_arg->get_jint_constant();
-        if (iconst > 0) {
+        jint iconst = right_arg->get_jint_constant();
+        if (iconst > 0 && iconst < max_jint) {
           if (is_power_of_2(iconst)) {
             use_constant = true;
           } else if (is_power_of_2(iconst - 1) || is_power_of_2(iconst + 1)) {

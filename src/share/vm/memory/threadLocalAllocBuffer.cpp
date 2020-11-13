@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -88,7 +88,8 @@ void ThreadLocalAllocBuffer::accumulate_statistics() {
       // The result can be larger than 1.0 due to direct to old allocations.
       // These allocations should ideally not be counted but since it is not possible
       // to filter them out here we just cap the fraction to be at most 1.0.
-      double alloc_frac = MIN2(1.0, (double) allocated_since_last_gc / used);
+      // Keep alloc_frac as float and not double to avoid the double to float conversion
+      float alloc_frac = MIN2(1.0f, allocated_since_last_gc / (float) used);
       _allocation_fraction.sample(alloc_frac);
     }
     global_stats()->update_allocating_threads();
@@ -205,9 +206,16 @@ void ThreadLocalAllocBuffer::initialize() {
   // this thread is redone in startup_initialization below.
   if (Universe::heap() != NULL) {
     size_t capacity   = Universe::heap()->tlab_capacity(myThread()) / HeapWordSize;
-    double alloc_frac = desired_size() * target_refills() / (double) capacity;
+    // Keep alloc_frac as float and not double to avoid the double to float conversion
+    float alloc_frac = desired_size() * target_refills() / (float) capacity;
     _allocation_fraction.sample(alloc_frac);
   }
+
+#if INCLUDE_ALL_GCS
+  if (UsePerTenantTLAB) {
+    _my_thread = Thread::current();
+  }
+#endif
 
   set_refill_waste_limit(initial_refill_waste_limit());
 
@@ -287,10 +295,38 @@ void ThreadLocalAllocBuffer::verify() {
 }
 
 Thread* ThreadLocalAllocBuffer::myThread() {
+#if INCLUDE_ALL_GCS
+  if (UsePerTenantTLAB) {
+    return _my_thread;
+  }
+#endif
   return (Thread*)(((char *)this) +
                    in_bytes(start_offset()) -
                    in_bytes(Thread::tlab_start_offset()));
 }
+
+#if INCLUDE_ALL_GCS
+
+void ThreadLocalAllocBuffer::swap_content(ThreadLocalAllocBuffer* peer) {
+  assert(UseG1GC && TenantHeapIsolation
+         && UsePerTenantTLAB && peer != NULL, "sanity");
+  assert(peer->myThread() == this->myThread()
+         && (Thread::current() == this->myThread() || SafepointSynchronize::is_at_safepoint()),
+         "only for self thread");
+
+  // do swapping
+  unsigned char buf[sizeof(ThreadLocalAllocBuffer)];
+  memcpy(buf, this, sizeof(ThreadLocalAllocBuffer));
+  memcpy(this, peer, sizeof(ThreadLocalAllocBuffer));
+  memcpy(peer, buf, sizeof(ThreadLocalAllocBuffer));
+
+  // restore linkage info
+  ThreadLocalAllocBuffer* tmp_next = this->next();
+  this->set_next(peer->next());
+  peer->set_next(tmp_next);
+}
+
+#endif // #if INCLUDE_ALL_GCS
 
 
 GlobalTLABStats::GlobalTLABStats() :

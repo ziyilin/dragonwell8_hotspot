@@ -37,6 +37,7 @@
 #include "memory/space.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/orderAccess.inline.hpp"
+#include "gc_implementation/g1/heapRegionTracer.hpp"
 
 PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
 
@@ -211,6 +212,31 @@ void HeapRegion::calc_gc_efficiency() {
   _gc_efficiency = (double) reclaimable_bytes() / region_elapsed_time_ms;
 }
 
+void HeapRegion::set_free() {
+  report_region_type_change(G1HeapRegionTraceType::Free);
+  _type.set_free();
+}
+
+void HeapRegion::set_eden() {
+  report_region_type_change(G1HeapRegionTraceType::Eden);
+  _type.set_eden();
+}
+
+void HeapRegion::set_eden_pre_gc() {
+  report_region_type_change(G1HeapRegionTraceType::Eden);
+  _type.set_eden_pre_gc();
+}
+
+void HeapRegion::set_survivor() {
+  report_region_type_change(G1HeapRegionTraceType::Survivor);
+  _type.set_survivor();
+}
+
+void HeapRegion::set_old() {
+  report_region_type_change(G1HeapRegionTraceType::Old);
+  _type.set_old();
+}
+
 void HeapRegion::set_startsHumongous(HeapWord* new_top, HeapWord* new_end) {
   assert(!isHumongous(), "sanity / pre-condition");
   assert(end() == _orig_end,
@@ -218,6 +244,7 @@ void HeapRegion::set_startsHumongous(HeapWord* new_top, HeapWord* new_end) {
   assert(top() == bottom(), "should be empty");
   assert(bottom() <= new_top && new_top <= new_end, "pre-condition");
 
+  report_region_type_change(G1HeapRegionTraceType::StartsHumongous);
   _type.set_starts_humongous();
   _humongous_start_region = this;
 
@@ -232,6 +259,7 @@ void HeapRegion::set_continuesHumongous(HeapRegion* first_hr) {
   assert(top() == bottom(), "should be empty");
   assert(first_hr->startsHumongous(), "pre-condition");
 
+  report_region_type_change(G1HeapRegionTraceType::ContinuesHumongous);
   _type.set_continues_humongous();
   _humongous_start_region = first_hr;
 }
@@ -303,8 +331,35 @@ void HeapRegion::initialize(MemRegion mr, bool clear_space, bool mangle_space) {
   record_timestamp();
 }
 
+void HeapRegion::report_region_type_change(G1HeapRegionTraceType::Type to) {
+  HeapRegionTracer::send_region_type_change(_hrm_index,
+                                            get_trace_type(),
+                                            to,
+                                            (uintptr_t)bottom(),
+                                            used());
+}
+
 CompactibleSpace* HeapRegion::next_compaction_space() const {
-  return G1CollectedHeap::heap()->next_compaction_region(this);
+  if (TenantHeapIsolation) {
+    assert_at_safepoint(true /* in vm thread */);
+
+    G1CollectedHeap* g1h = G1CollectedHeap::heap();
+    assert(NULL != g1h, "g1h cannot be NULL");
+    HeapRegion* hr = g1h->next_compaction_region(this);
+    while (NULL != hr) {
+      assert(!hr->isHumongous(), "just checking");
+      if (hr->allocation_context() == allocation_context()) {
+        return hr;
+      }
+      hr = g1h->next_compaction_region(hr);
+    }
+    // The worst case is to return 'this', cannot be NULL
+    assert(NULL != hr, "post-condition");
+    return hr;
+
+  } else {
+    return G1CollectedHeap::heap()->next_compaction_region(this);
+  }
 }
 
 void HeapRegion::note_self_forwarding_removal_start(bool during_initial_mark,
@@ -627,7 +682,15 @@ void HeapRegion::verify_strong_code_roots(VerifyOption vo, bool* failures) const
 
 void HeapRegion::print() const { print_on(gclog_or_tty); }
 void HeapRegion::print_on(outputStream* st) const {
-  st->print("AC%4u", allocation_context());
+  if (TenantHeapIsolation) {
+    if (NULL == tenant_allocation_context()) {
+      st->print("  TENANT-ROOT");
+    } else {
+      assert(!allocation_context().is_system(), "Inconsistent allocation contexts");
+      st->print("  TENANT-" PTR_FORMAT, allocation_context().tenant_allocation_context());
+    }
+  }
+  st->print(" AC%4u", allocation_context().allocation_context());
   st->print(" %2s", get_short_type_str());
   if (in_collection_set())
     st->print(" CS");
@@ -972,6 +1035,29 @@ void HeapRegion::verify(VerifyOption vo,
   }
 
   verify_strong_code_roots(vo, failures);
+}
+
+
+
+void HeapRegion::set_allocation_context(AllocationContext_t context) {
+  assert(Heap_lock->owned_by_self() || SafepointSynchronize::is_at_safepoint(), "not locked");
+  if (TenantHeapIsolation && context != allocation_context() /* do not count self-set */) {
+    if (context.is_system()) {
+      assert(!allocation_context().is_system(), "pre-condition");
+      G1TenantAllocationContext* tac = allocation_context().tenant_allocation_context();
+      assert(NULL != tac, "pre-condition");
+      tac->dec_occupied_heap_region_count();
+    } else {
+      assert(allocation_context().is_system(), "pre-condition");
+      G1TenantAllocationContext* tac = context.tenant_allocation_context();
+      assert(NULL != tac, "pre-condition");
+      tac->inc_occupied_heap_region_count();
+    }
+  } else {
+    DEBUG_ONLY(assert(!TenantHeapIsolation
+                      || (context.is_system() && allocation_context().is_system()), "just checking"));
+  }
+  _allocation_context = context;
 }
 
 void HeapRegion::verify() const {

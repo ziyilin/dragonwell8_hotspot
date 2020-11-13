@@ -25,9 +25,10 @@
 #ifndef SHARE_VM_CLASSFILE_VMSYMBOLS_HPP
 #define SHARE_VM_CLASSFILE_VMSYMBOLS_HPP
 
-#include "oops/symbol.hpp"
+#include "jfr/support/jfrIntrinsics.hpp"
 #include "memory/iterator.hpp"
-#include "trace/traceMacros.hpp"
+#include "oops/symbol.hpp"
+#include "utilities/macros.hpp"
 
 // The class vmSymbols is a name space for fast lookup of
 // symbols commonly used in the VM.
@@ -53,6 +54,12 @@
   template(java_lang_Object,                          "java/lang/Object")                         \
   template(java_lang_Class,                           "java/lang/Class")                          \
   template(java_lang_String,                          "java/lang/String")                         \
+  template(com_alibaba_tenant_TenantGlobals,          "com/alibaba/tenant/TenantGlobals")         \
+  template(com_alibaba_tenant_TenantConfiguration,    "com/alibaba/tenant/TenantConfiguration")   \
+  template(com_alibaba_tenant_TenantState,            "com/alibaba/tenant/TenantState")           \
+  template(com_alibaba_tenant_TenantException,        "com/alibaba/tenant/TenantException")       \
+  template(com_alibaba_tenant_TenantContainer,        "com/alibaba/tenant/TenantContainer")       \
+  template(com_alibaba_tenant_JGroup,                 "com/alibaba/tenant/JGroup")                \
   template(java_lang_Thread,                          "java/lang/Thread")                         \
   template(java_lang_ThreadGroup,                     "java/lang/ThreadGroup")                    \
   template(java_lang_Cloneable,                       "java/lang/Cloneable")                      \
@@ -314,8 +321,10 @@
   template(group_name,                                "group")                                    \
   template(daemon_name,                               "daemon")                                   \
   template(eetop_name,                                "eetop")                                    \
+  template(inheritedTenantContainer_name,             "inheritedTenantContainer")                 \
   template(thread_status_name,                        "threadStatus")                             \
   template(run_method_name,                           "run")                                      \
+  template(runThread_method_name,                     "runThread")                                \
   template(exit_method_name,                          "exit")                                     \
   template(add_method_name,                           "add")                                      \
   template(remove_method_name,                        "remove")                                   \
@@ -336,12 +345,16 @@
   template(uncaughtException_name,                    "uncaughtException")                        \
   template(dispatchUncaughtException_name,            "dispatchUncaughtException")                \
   template(initializeSystemClass_name,                "initializeSystemClass")                    \
+  template(initializeWispClass_name,                  "initializeWispClass")                      \
+  template(startWispDaemons_name,                     "startWispDaemons")                         \
   template(loadClass_name,                            "loadClass")                                \
   template(loadClassInternal_name,                    "loadClassInternal")                        \
   template(get_name,                                  "get")                                      \
   template(put_name,                                  "put")                                      \
   template(type_name,                                 "type")                                     \
   template(findNative_name,                           "findNative")                               \
+  template(initializeTenantContainerClass_name,       "initializeTenantContainerClass")           \
+  template(initializeJGroupClass_name,                "initializeJGroupClass")                    \
   template(deadChild_name,                            "deadChild")                                \
   template(addClass_name,                             "addClass")                                 \
   template(throwIllegalAccessError_name,              "throwIllegalAccessError")                  \
@@ -410,6 +423,11 @@
   template(signers_name,                              "signers_name")                             \
   template(loader_data_name,                          "loader_data")                              \
   template(dependencies_name,                         "dependencies")                             \
+  template(com_alibaba_jwarmup_JWarmUp,               "com/alibaba/jwarmup/JWarmUp")              \
+  template(jwarmup_notify_application_startup_is_done_name, "notifyApplicationStartUpIsDone")     \
+  template(jwarmup_check_if_compilation_is_complete_name, "checkIfCompilationIsComplete")         \
+  template(jwarmup_notify_jvm_deopt_warmup_methods_name,  "notifyJVMDeoptWarmUpMethods")          \
+  template(jwarmup_dummy_name,                        "dummy")                                    \
   template(input_stream_void_signature,               "(Ljava/io/InputStream;)V")                 \
   template(getFileURL_name,                           "getFileURL")                               \
   template(getFileURL_signature,                      "(Ljava/io/File;)Ljava/net/URL;")           \
@@ -440,6 +458,7 @@
   template(void_float_signature,                      "()F")                                      \
   template(void_double_signature,                     "()D")                                      \
   template(int_void_signature,                        "(I)V")                                     \
+  template(long_void_signature,                       "(J)V")                                     \
   template(int_int_signature,                         "(I)I")                                     \
   template(char_char_signature,                       "(C)C")                                     \
   template(short_short_signature,                     "(S)S")                                     \
@@ -468,6 +487,7 @@
   template(object_boolean_signature,                  "(Ljava/lang/Object;)Z")                    \
   template(string_void_signature,                     "(Ljava/lang/String;)V")                    \
   template(string_int_signature,                      "(Ljava/lang/String;)I")                    \
+  template(runnable_void_signature,                   "(Ljava/lang/Runnable;)V")                  \
   template(throwable_void_signature,                  "(Ljava/lang/Throwable;)V")                 \
   template(void_throwable_signature,                  "()Ljava/lang/Throwable;")                  \
   template(throwable_throwable_signature,             "(Ljava/lang/Throwable;)Ljava/lang/Throwable;")             \
@@ -501,6 +521,7 @@
   template(exception_void_signature,                  "(Ljava/lang/Exception;)V")                                 \
   template(protectiondomain_signature,                "[Ljava/security/ProtectionDomain;")                        \
   template(accesscontrolcontext_signature,            "Ljava/security/AccessControlContext;")                     \
+  template(tenantcontainer_signature,                 "Lcom/alibaba/tenant/TenantContainer;")                     \
   template(class_protectiondomain_signature,          "(Ljava/lang/Class;Ljava/security/ProtectionDomain;)V")     \
   template(thread_signature,                          "Ljava/lang/Thread;")                                       \
   template(thread_array_signature,                    "[Ljava/lang/Thread;")                                      \
@@ -509,7 +530,8 @@
   template(class_array_signature,                     "[Ljava/lang/Class;")                                       \
   template(classloader_signature,                     "Ljava/lang/ClassLoader;")                                  \
   template(object_signature,                          "Ljava/lang/Object;")                                       \
-  template(object_array_signature,                    "[Ljava/lang/Object;")                                       \
+  template(state_name,                                 "state")                                                   \
+  template(com_alibaba_tenant_TenantState_signature,   "Lcom/alibaba/tenant/TenantState;")                        \
   template(class_signature,                           "Ljava/lang/Class;")                                        \
   template(string_signature,                          "Ljava/lang/String;")                                       \
   template(reference_signature,                       "Ljava/lang/ref/Reference;")                                \
@@ -606,8 +628,61 @@
   template(classRedefinedCount_name,                   "classRedefinedCount")                                     \
   template(classLoader_name,                           "classLoader")                                             \
                                                                                                                   \
-  /* trace signatures */                                                                                          \
-  TRACE_TEMPLATES(template)                                                                                       \
+  /* jfr signatures */                                                                                            \
+  JFR_TEMPLATES(template)                                                                                         \
+  /* coroutine support */                                                                                         \
+  template(java_dyn_CoroutineSupport,                  "java/dyn/CoroutineSupport")                               \
+  template(java_dyn_CoroutineBase,                     "java/dyn/CoroutineBase")                                  \
+  template(java_dyn_CoroutineExitException,            "java/dyn/CoroutineExitException")                         \
+  template(com_alibaba_wisp_engine_WispTask,           "com/alibaba/wisp/engine/WispTask")                        \
+  template(com_alibaba_wisp_engine_WispTask_CacheableCoroutine,                                                   \
+                                                       "com/alibaba/wisp/engine/WispTask$CacheableCoroutine")     \
+  template(com_alibaba_wisp_engine_WispEngine,         "com/alibaba/wisp/engine/WispEngine")                      \
+  template(com_alibaba_wisp_engine_WispCarrier,        "com/alibaba/wisp/engine/WispCarrier")                     \
+  template(com_alibaba_wisp_engine_WispEventPump,      "com/alibaba/wisp/engine/WispEventPump")                   \
+  template(isInCritical_name,                          "isInCritical")                                            \
+  template(jdkParkStatus_name,                         "jdkParkStatus")                                           \
+  template(jvmParkStatus_name,                         "jvmParkStatus")                                           \
+  template(id_name,                                    "id")                                                      \
+  template(threadWrapper_name,                         "threadWrapper")                                           \
+  template(activeCount_name,                           "activeCount")                                             \
+  template(stealCount_name,                            "stealCount")                                              \
+  template(stealFailureCount_name,                     "stealFailureCount")                                       \
+  template(preemptCount_name,                          "preemptCount")                                            \
+  template(unparkById_name,                            "unparkById")                                              \
+  template(interruptById_name,                         "interruptById")                                           \
+  template(interrupted_name,                           "interrupted")                                             \
+  template(yield_name,                                 "yield")                                                   \
+  template(runOutsideWisp_name,                        "runOutsideWisp")                                          \
+  template(nativeCoroutine_name,                       "nativeCoroutine")                                         \
+  template(stack_name,                                 "stack")                                                   \
+  template(current_name,                               "current")                                                 \
+  template(java_dyn_CoroutineBase_signature,           "Ljava/dyn/CoroutineBase;")                                \
+  template(reflect_method_signature,                   "Ljava/lang/reflect/Method;")                              \
+  template(startInternal_method_name,                  "startInternal")                                           \
+  template(initializeCoroutineSupport_method_name,     "initializeCoroutineSupport")                              \
+  template(destroyCoroutineSupport_method_name,        "destroyCoroutineSupport")                                 \
+  template(method_name,                                "method")                                                  \
+  template(bci_name,                                   "bci")                                                     \
+  template(localCount_name,                            "localCount")                                              \
+  template(expressionCount_name,                       "expressionCount")                                         \
+  template(scalarValues_name,                          "scalarValues")                                            \
+  template(objectValues_name,                          "objectValues")                                            \
+  template(long_array_signature,                       "[J")                                                      \
+  template(object_array_signature,                     "[Ljava/lang/Object;")                                     \
+                                                                                                                  \
+  /* coroutine work steal support */                                                                              \
+  template(java_security_AccessController,             "java/security/AccessController")                          \
+  template(doPrivileged_name,                          "doPrivileged")                                            \
+  template(doPrivileged_signature_1,                   "(Ljava/security/PrivilegedAction;)Ljava/lang/Object;")    \
+  template(doPrivileged_signature_2,                   "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;)Ljava/lang/Object;")    \
+  template(doPrivileged_signature_3,                   "(Ljava/security/PrivilegedExceptionAction;)Ljava/lang/Object;")    \
+  template(doPrivileged_signature_4,                   "(Ljava/security/PrivilegedExceptionAction;Ljava/security/AccessControlContext;)Ljava/lang/Object;")    \
+  template(sun_reflect_NativeMethodAccessorImpl,       "sun/reflect/NativeMethodAccessorImpl")                    \
+  template(invoke0_name,                               "invoke0")                                                 \
+  template(invoke0_signature,                          "(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")  \
+  template(sun_reflect_NativeConstructorAccessorImpl,  "sun/reflect/NativeConstructorAccessorImpl")               \
+  template(newInstance0_signature,                     "(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;")  \
                                                                                                                   \
   /*end*/
 
@@ -736,7 +811,7 @@
   do_intrinsic(_nanoTime,                 java_lang_System,       nanoTime_name,          void_long_signature,   F_S)   \
    do_name(     nanoTime_name,                                   "nanoTime")                                            \
                                                                                                                         \
-  TRACE_INTRINSICS(do_intrinsic, do_class, do_name, do_signature, do_alias)                                             \
+  JFR_INTRINSICS(do_intrinsic, do_class, do_name, do_signature, do_alias)                                               \
                                                                                                                         \
   do_intrinsic(_arraycopy,                java_lang_System,       arraycopy_name, arraycopy_signature,           F_S)   \
    do_name(     arraycopy_name,                                  "arraycopy")                                           \
@@ -745,7 +820,7 @@
    do_name(     isInterrupted_name,                              "isInterrupted")                                       \
    do_signature(isInterrupted_signature,                         "(Z)Z")                                                \
   do_intrinsic(_currentThread,            java_lang_Thread,       currentThread_name, currentThread_signature,   F_S)   \
-   do_name(     currentThread_name,                              "currentThread")                                       \
+   do_name(     currentThread_name,                              "currentThread0")                                      \
    do_signature(currentThread_signature,                         "()Ljava/lang/Thread;")                                \
                                                                                                                         \
   /* reflective intrinsics, for java/lang/Class, etc. */                                                                \
@@ -879,6 +954,10 @@
   do_intrinsic(_updateByteBufferCRC32,     java_util_zip_CRC32,   updateByteBuffer_name, updateByteBuffer_signature, F_SN) \
    do_name(     updateByteBuffer_name,                           "updateByteBuffer")                                    \
    do_signature(updateByteBuffer_signature,                      "(IJII)I")                                             \
+                                                                                                                        \
+  /* support for com.alibaba.tenant.TenantContainer */                                                                  \
+  do_name(      allocation_context_address,                      "allocationContext")                                   \
+  do_name(      tenant_id_address,                               "tenantId")                                            \
                                                                                                                         \
   /* support for sun.misc.Unsafe */                                                                                     \
   do_class(sun_misc_Unsafe,               "sun/misc/Unsafe")                                                            \
@@ -1072,8 +1151,18 @@
    do_name(     prefetchReadStatic_name,                         "prefetchReadStatic")                                  \
   do_intrinsic(_prefetchWriteStatic,      sun_misc_Unsafe,        prefetchWriteStatic_name, prefetch_signature,  F_SN)  \
    do_name(     prefetchWriteStatic_name,                        "prefetchWriteStatic")                                 \
+                                                                                                                        \
     /*== LAST_COMPILER_INLINE*/                                                                                         \
     /*the compiler does have special inlining code for these; bytecode inline is just fine */                           \
+                                                                                                                        \
+  /* coroutine intrinsics */                                                                                            \
+  do_intrinsic(_switchTo,                 java_dyn_CoroutineSupport, switchTo_name, switchTo_signature, F_SN)           \
+   do_name(     switchTo_name,                                    "switchTo")                                           \
+   do_signature(switchTo_signature,                               "(Ljava/dyn/CoroutineBase;Ljava/dyn/CoroutineBase;)V") \
+  do_intrinsic(_switchToAndTerminate,     java_dyn_CoroutineSupport, switchToAndTerminate_name, switchTo_signature, F_SN) \
+   do_name(     switchToAndTerminate_name,                        "switchToAndTerminate")                               \
+  do_intrinsic(_switchToAndExit,          java_dyn_CoroutineSupport, switchToAndExit_name, switchTo_signature, F_SN)    \
+   do_name(     switchToAndExit_name,                             "switchToAndExit")                                    \
                                                                                                                         \
   do_intrinsic(_fillInStackTrace,         java_lang_Throwable, fillInStackTrace_name, void_throwable_signature,  F_RNY) \
                                                                                                                           \
